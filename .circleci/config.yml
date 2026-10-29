@@ -28,7 +28,7 @@ jobs:
 
       # -----------------------------------------------
       # 1. INSTALL SALESFORCE CLI AND REQUIRED TOOLS
-      # -----------------------------------------------
+      # -----------------------------------------------      
       - run:
           name: Install Salesforce CLI and Tools
           command: |
@@ -39,23 +39,21 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y jq
 
-            # Allow trusted unsigned plugins in CircleCI.
+            # Configure trusted unsigned plugins.
             mkdir -p "$HOME/.config/sf"
 
-            cat > "$HOME/.config/sf/unsignedPluginAllowList.json" <<'EOF'
-            [
-              "sfdx-git-delta",
-              "@salesforce/sfdx-scanner"
-            ]
-            EOF
+            printf '%s\n' \
+              '["sfdx-git-delta","@salesforce/sfdx-scanner"]' \
+              > "$HOME/.config/sf/unsignedPluginAllowList.json"
 
-            # Install plugins without interactive prompts.
+            # Install plugins.
             sf plugins install sfdx-git-delta
             sf plugins install @salesforce/sfdx-scanner
 
             # Verify installation.
             sf --version
             sf plugins
+
 
       # -----------------------------------------------
       # 2. RESOLVE TARGET ENVIRONMENT
