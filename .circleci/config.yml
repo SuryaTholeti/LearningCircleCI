@@ -1,31 +1,201 @@
+
 version: 2.1
 
 jobs:
-  salesforce-lwc-ci:
+  salesforce_pipeline:
+    parameters:
+      mode:
+        type: enum
+        enum: ["pr_validate", "deploy"]
+      environment:
+        type: enum
+        enum: ["pr", "qa", "uat", "prod"]
+
     docker:
-      - image: cimg/node:22.14
+      - image: cimg/node:22.17
+
+    working_directory: ~/project
 
     steps:
       - checkout
 
-      - restore_cache:
-          keys:
-            - npm-v1-{{ checksum "package-lock.json" }}
-            - npm-v1-
+      - run:
+          name: Install Salesforce CLI and plugins
+          command: |
+            set -euo pipefail
+            sudo npm install --global @salesforce/cli@2.143.6
+            sudo apt-get update && sudo apt-get install --yes jq
+            echo y | sf plugins install sfdx-git-delta
+            echo y | sf plugins install @salesforce/sfdx-scanner
+            sf --version
 
       - run:
-          name: Install dependencies
-          command: npm ci
-
-      - save_cache:
-          key: npm-v1-{{ checksum "package-lock.json" }}
-          paths:
-            - ~/.npm
+          name: Resolve target branch and environment
+          command: |
+            set -euo pipefail
+            MODE="<< parameters.mode >>"; ENVIRONMENT="<< parameters.environment >>"
+            if [ "$MODE" = "pr_validate" ]; then
+              if [ -z "${CIRCLE_PULL_REQUEST:-}" ]; then echo "No PR detected; skipping PR validation."; echo "export SKIP_PIPELINE=true" >> "$BASH_ENV"; exit 0; fi
+              : "${GH_API_TOKEN:?Set GH_API_TOKEN in CircleCI}"
+              PR_NUMBER="${CIRCLE_PULL_REQUEST##*/}"
+              PR_DATA=$(curl --fail --silent --show-error -H "Authorization: Bearer ${GH_API_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls/${PR_NUMBER}")
+              BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.base.ref')
+              case "$BASE_BRANCH" in
+                QA) ENVIRONMENT="qa" ;;
+                UAT) ENVIRONMENT="uat" ;;
+                main) ENVIRONMENT="prod" ;;
+                *) echo "Unsupported PR target: $BASE_BRANCH"; echo "export SKIP_PIPELINE=true" >> "$BASH_ENV"; exit 0 ;;
+              esac
+            else
+              case "$ENVIRONMENT" in
+                qa) BASE_BRANCH="QA" ;;
+                uat) BASE_BRANCH="UAT" ;;
+                prod) BASE_BRANCH="main" ;;
+                *) echo "Unsupported environment: $ENVIRONMENT"; exit 1 ;;
+              esac
+            fi
+            echo "export PIPELINE_MODE='$MODE'" >> "$BASH_ENV"
+            echo "export BASE_BRANCH='$BASE_BRANCH'" >> "$BASH_ENV"
+            echo "export TARGET_ENVIRONMENT='$ENVIRONMENT'" >> "$BASH_ENV"
+            echo "Target branch: $BASE_BRANCH; Environment: $ENVIRONMENT"
 
       - run:
-          name: Run LWC Jest tests
-          command: npm test
+          name: Generate Salesforce delta
+          command: |
+            set -euo pipefail
+            source "$BASH_ENV"
+            if [ "${SKIP_PIPELINE:-false}" = "true" ]; then exit 0; fi
+            git fetch origin --prune
+            git fetch --unshallow 2>/dev/null || true
+            if [ -n "${COMMIT_ID:-}" ]; then FROM_COMMIT="$COMMIT_ID"
+            elif [ "$PIPELINE_MODE" = "pr_validate" ]; then git fetch origin "$BASE_BRANCH" --depth=100; FROM_COMMIT=$(git merge-base HEAD "origin/$BASE_BRANCH")
+            else FROM_COMMIT=$(git rev-parse HEAD^ 2>/dev/null || true)
+            fi
+            if [ -z "${FROM_COMMIT:-}" ]; then echo "Unable to determine previous commit."; exit 1; fi
+            rm -rf delta && mkdir -p delta
+            sf sgd source delta --from "$FROM_COMMIT" --to HEAD --output-dir delta --generate-delta
+            mkdir -p delta/src/main/default reports
+            if [ -f delta/package/package.xml ]; then cp delta/package/package.xml delta/src/package.xml; fi
+            if [ -d delta/force-app/main/default ]; then cp -R delta/force-app/main/default/. delta/src/main/default/; fi
+            if [ -d delta/src/main/default ] && find delta/src/main/default -type f | grep -q .; then echo "export HAS_SOURCE=true" >> "$BASH_ENV"; else echo "export HAS_SOURCE=false" >> "$BASH_ENV"; fi
+            if [ -f destructiveChanges/destructiveChanges.xml ] && grep -q '<members>' destructiveChanges/destructiveChanges.xml; then cp destructiveChanges/destructiveChanges.xml delta/destructiveChanges.xml; echo "export HAS_DESTRUCTIVE=true" >> "$BASH_ENV"; else echo "export HAS_DESTRUCTIVE=false" >> "$BASH_ENV"; fi
+            if [ -f delta/src/package.xml ]; then echo "Package manifest generated."; else echo "No package manifest generated."; fi
+            echo "Delta generation completed."
 
       - run:
-          name: Run ESLint
-          command: npm run lint
+          name: Salesforce Code Analyzer - PMD
+          command: |
+            set -euo pipefail
+            source "$BASH_ENV"
+            mkdir -p pmd-output
+            if [ "${SKIP_PIPELINE:-false}" = "true" ] || [ "${HAS_SOURCE:-false}" != "true" ]; then echo "No source changes to scan."; exit 0; fi
+            TARGET_PATH="delta/src/main/default"
+            sf scanner run --engine pmd --target "$TARGET_PATH" --format table --category "Best Practices" --category "Performance" --category "Security" --severity-threshold 3 || true
+            sf scanner run --engine pmd --target "$TARGET_PATH" --format json --outfile pmd-output/pmd-report.json --category "Best Practices" --category "Performance" --category "Security" --severity-threshold 3 || true
+            sf scanner run --engine pmd --target "$TARGET_PATH" --format html --outfile pmd-output/pmd-report.html --category "Best Practices" --category "Performance" --category "Security" --severity-threshold 3 || true
+            if [ ! -s pmd-output/pmd-report.json ]; then echo "No PMD report generated."; exit 0; fi
+            jq '[.[] | .violations[]]' pmd-output/pmd-report.json > pmd-output/flat.json
+            TOTAL=$(jq 'length' pmd-output/flat.json); HIGH=$(jq '[.[] | select(.severity == 1 or .severity == 2)] | length' pmd-output/flat.json); MEDIUM=$(jq '[.[] | select(.severity == 3)] | length' pmd-output/flat.json); LOW=$(jq '[.[] | select(.severity >= 4)] | length' pmd-output/flat.json)
+            echo "PMD Summary: High=$HIGH Medium=$MEDIUM Low=$LOW Total=$TOTAL"
+            jq -r '.[] | select(.severity == 1 or .severity == 2) | "\(.fileName):\(.line) - \(.ruleName)"' pmd-output/flat.json
+            if [ "$HIGH" -gt 0 ]; then echo "High-severity PMD violations detected."; exit 1; fi
+
+      - store_artifacts:
+          path: pmd-output
+          destination: PMDReports
+          when: always
+
+      - run:
+          name: Authenticate Salesforce using JWT
+          command: |
+            set -euo pipefail
+            source "$BASH_ENV"
+            if [ "${SKIP_PIPELINE:-false}" = "true" ]; then exit 0; fi
+            case "$TARGET_ENVIRONMENT" in
+              qa) CLIENT_ID="${SF_QA_CLIENT_ID:?Missing SF_QA_CLIENT_ID}"; USERNAME="${SF_QA_USERNAME:?Missing SF_QA_USERNAME}"; INSTANCE_URL="${SF_QA_INSTANCE_URL:?Missing SF_QA_INSTANCE_URL}"; KEY_B64="${SF_QA_JWT_KEY_B64:?Missing SF_QA_JWT_KEY_B64}" ;;
+              uat) CLIENT_ID="${SF_UAT_CLIENT_ID:?Missing SF_UAT_CLIENT_ID}"; USERNAME="${SF_UAT_USERNAME:?Missing SF_UAT_USERNAME}"; INSTANCE_URL="${SF_UAT_INSTANCE_URL:?Missing SF_UAT_INSTANCE_URL}"; KEY_B64="${SF_UAT_JWT_KEY_B64:?Missing SF_UAT_JWT_KEY_B64}" ;;
+              prod) CLIENT_ID="${SF_PROD_CLIENT_ID:?Missing SF_PROD_CLIENT_ID}"; USERNAME="${SF_PROD_USERNAME:?Missing SF_PROD_USERNAME}"; INSTANCE_URL="${SF_PROD_INSTANCE_URL:?Missing SF_PROD_INSTANCE_URL}"; KEY_B64="${SF_PROD_JWT_KEY_B64:?Missing SF_PROD_JWT_KEY_B64}" ;;
+              *) echo "Unknown environment: $TARGET_ENVIRONMENT"; exit 1 ;;
+            esac
+            KEY_FILE=$(mktemp); trap 'rm -f "$KEY_FILE"' EXIT
+            printf '%s' "$KEY_B64" | base64 --decode > "$KEY_FILE"; chmod 600 "$KEY_FILE"
+            sf org login jwt --client-id "$CLIENT_ID" --jwt-key-file "$KEY_FILE" --username "$USERNAME" --instance-url "$INSTANCE_URL" --alias targetorg
+            sf org display --target-org targetorg
+
+      - run:
+          name: Validate PR or deploy merged changes
+          command: |
+            set -euo pipefail
+            source "$BASH_ENV"
+            if [ "${SKIP_PIPELINE:-false}" = "true" ]; then exit 0; fi
+            if [ "${HAS_SOURCE:-false}" != "true" ] && [ "${HAS_DESTRUCTIVE:-false}" != "true" ]; then echo "No metadata changes to process."; exit 0; fi
+            TEST_ARGS=()
+            if [ "$TARGET_ENVIRONMENT" = "prod" ]; then TEST_ARGS=(--test-level RunSpecifiedTests --tests EpicAccountContactRelationBatchTest --tests EpicActivityUpdateBatchTest)
+            elif [ "$TARGET_ENVIRONMENT" = "uat" ]; then TEST_ARGS=(--test-level RunLocalTests)
+            elif find delta/src/main/default -type f \( -name '*.cls' -o -name '*.trigger' \) 2>/dev/null | grep -q .; then TEST_ARGS=(--test-level RunLocalTests)
+            else TEST_ARGS=(--test-level NoTestRun)
+            fi
+            DEPLOY_ARGS=(--target-org targetorg --wait 1000 --verbose)
+            if [ "${HAS_SOURCE:-false}" = "true" ]; then DEPLOY_ARGS+=(--manifest delta/src/package.xml); fi
+            if [ "${HAS_DESTRUCTIVE:-false}" = "true" ]; then DEPLOY_ARGS+=(--pre-destructive-changes delta/destructiveChanges.xml); fi
+            DEPLOY_ARGS+=("${TEST_ARGS[@]}")
+            if [ "$PIPELINE_MODE" = "pr_validate" ]; then echo "Validating PR changes without deployment."; sf project deploy start "${DEPLOY_ARGS[@]}" --dry-run
+            else echo "Deploying merged changes to $TARGET_ENVIRONMENT."; sf project deploy start "${DEPLOY_ARGS[@]}"
+            fi
+
+      - store_artifacts:
+          path: delta
+          destination: SalesforceDelta
+          when: always
+
+workflows:
+  version: 2
+
+  pull_request_validation:
+    jobs:
+      - salesforce_pipeline:
+          name: validate-pr
+          mode: pr_validate
+          environment: pr
+          filters:
+            branches:
+              only:
+                - feature/.*
+                - HotFix/.*
+
+  deploy_qa:
+    jobs:
+      - salesforce_pipeline:
+          name: deploy-qa
+          mode: deploy
+          environment: qa
+          filters:
+            branches:
+              only: QA
+
+  deploy_uat:
+    jobs:
+      - salesforce_pipeline:
+          name: deploy-uat
+          mode: deploy
+          environment: uat
+          filters:
+            branches:
+              only: UAT
+
+  deploy_production:
+    jobs:
+      - approve-production:
+          type: approval
+          filters:
+            branches:
+              only: main
+      - salesforce_pipeline:
+          name: deploy-production
+          mode: deploy
+          environment: prod
+          requires:
+            - approve-production
+          filters:
+            branches:
+              only: main
