@@ -224,6 +224,7 @@ jobs:
             echo "HAS_DELTA=${HAS_DELTA}"
             echo "HAS_CHANGES=${HAS_CHANGES}"
 
+      
       # -----------------------------------------------
       # 4. PMD / SALESFORCE CODE ANALYZER SCAN
       # -----------------------------------------------
@@ -236,37 +237,42 @@ jobs:
 
             SCAN_TARGET="force-app/main/default"
 
-            if [ "$HAS_DELTA" = "true" ] &&
+            if [ "${HAS_DELTA:-false}" = "true" ] &&
                [ -d "delta/force-app/main/default" ]; then
               SCAN_TARGET="delta/force-app/main/default"
             fi
 
             echo "Scanning: ${SCAN_TARGET}"
+            java -version
 
             SCAN_STATUS=0
 
-            sf scanner run \
-              --engine pmd \
-              --target "$SCAN_TARGET" \
-              --format json \
-              --outfile pmd-output/pmd-report.json \
+            # Run Salesforce Code Analyzer v5.
+            sf code-analyzer run \
+              --rule-selector pmd \
+              --workspace "$SCAN_TARGET" \
+              --output-file pmd-output/pmd-report.json \
+              --output-file pmd-output/pmd-summary.html \
+              --severity-threshold High \
               || SCAN_STATUS=$?
 
-            # Initialize a report even when the scanner fails.
+            # Preserve the scanner exit code.
             if [ ! -s pmd-output/pmd-report.json ]; then
+              echo "WARNING: JSON report was not generated."
               printf '{"violations":[]}\n' \
                 > pmd-output/pmd-report.json
             fi
 
+            # Validate the JSON report.
             if ! jq -e . pmd-output/pmd-report.json >/dev/null 2>&1; then
-              echo "ERROR: PMD output is not valid JSON."
+              echo "ERROR: PMD JSON report is invalid."
               SCAN_STATUS=1
               printf '{"violations":[]}\n' \
                 > pmd-output/pmd-report.json
             fi
 
-            # Normalize common Code Analyzer JSON structures.
-            jq '
+            # Normalize findings from supported report structures.
+            if ! jq '
               def allv:
                 if type == "array" then
                   [
@@ -283,13 +289,16 @@ jobs:
                   []
                 end;
 
-              allv |
-              map(select(type == "object"))
+              allv | map(select(type == "object"))
             ' pmd-output/pmd-report.json \
-              > pmd-output/findings.json
+              > pmd-output/findings.json; then
+              echo "ERROR: Could not normalize scanner findings."
+              SCAN_STATUS=1
+              printf '[]\n' > pmd-output/findings.json
+            fi
 
-            # Classify common numeric and textual severities.
-            jq '
+            # Classify findings by severity.
+            if ! jq '
               map(
                 . as $v |
                 (
@@ -312,56 +321,82 @@ jobs:
                 }
               )
             ' pmd-output/findings.json \
-              > pmd-output/classified.json
+              > pmd-output/classified.json; then
+              echo "ERROR: Could not classify PMD findings."
+              SCAN_STATUS=1
+              printf '[]\n' > pmd-output/classified.json
+            fi
 
             HIGH_COUNT=$(jq '[.[] | select(.pipelineSeverity == "High")] | length' pmd-output/classified.json)
             MEDIUM_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Medium")] | length' pmd-output/classified.json)
             LOW_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Low")] | length' pmd-output/classified.json)
 
-            echo "High severity: ${HIGH_COUNT}"
-            echo "Medium severity: ${MEDIUM_COUNT}"
-            echo "Low severity: ${LOW_COUNT}"
+            echo "======================================"
+            echo "PMD Severity Summary"
+            echo "High   : ${HIGH_COUNT}"
+            echo "Medium : ${MEDIUM_COUNT}"
+            echo "Low    : ${LOW_COUNT}"
+            echo "======================================"
 
-            # Generate an HTML summary.
+            # Generate a custom HTML summary.
             {
-              echo '<!doctype html><html><head><meta charset="utf-8">'
+              echo '<!doctype html>'
+              echo '<html><head><meta charset="utf-8">'
               echo '<title>Salesforce PMD Report</title>'
-              echo '<style>body{font-family:Arial;margin:24px}'
+              echo '<style>'
+              echo 'body{font-family:Arial,sans-serif;margin:24px}'
               echo '.card{display:inline-block;padding:16px;margin:6px;border-radius:8px;color:white}'
-              echo '.high{background:#c62828}.medium{background:#ef6c00}.low{background:#2e7d32}'
+              echo '.high{background:#c62828}'
+              echo '.medium{background:#ef6c00}'
+              echo '.low{background:#2e7d32}'
               echo 'table{border-collapse:collapse;width:100%;margin-top:20px}'
               echo 'td,th{border:1px solid #ddd;padding:8px;text-align:left}'
               echo '</style></head><body>'
               echo '<h1>Salesforce PMD Scan Report</h1>'
-              echo "<p>Target: ${SCAN_TARGET}</p>"
+              echo "<p>Scan target: ${SCAN_TARGET}</p>"
               echo "<div class='card high'>High: ${HIGH_COUNT}</div>"
               echo "<div class='card medium'>Medium: ${MEDIUM_COUNT}</div>"
               echo "<div class='card low'>Low: ${LOW_COUNT}</div>"
               echo '<table><tr><th>Severity</th><th>Rule</th><th>Message</th><th>File</th><th>Line</th></tr>'
             } > pmd-output/pmd-summary.html
 
-            jq -r '
-              .[] |
-              [
-                .pipelineSeverity,
-                (.ruleName // .rule // .ruleId // "Unknown"),
-                (.message // .description // ""),
-                (.fileName // .file // .uri // ""),
-                (.line // .lineNumber // "")
-              ] |
-              @tsv
-            ' pmd-output/classified.json |
-            while IFS="$(printf '\t')" read -r SEVERITY RULE MESSAGE FILE LINE; do
-              ESCAPED=$(printf '%s' "$MESSAGE" |
-                sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            # Escape HTML special characters in report fields.
+            html_escape() {
+              printf '%s' "$1" |
+                sed \
+                  -e 's/\&/\&amp;/g' \
+                  -e 's/</\&lt;/g' \
+                  -e 's/>/\&gt;/g' \
+                  -e 's/"/\&quot;/g' \
+                  -e "s/'/\&#39;/g"
+            }
+
+            while IFS= read -r FINDING; do
+              SEVERITY=$(printf '%s' "$FINDING" |
+                jq -r '.pipelineSeverity // "Low"')
+              RULE=$(printf '%s' "$FINDING" |
+                jq -r '.ruleName // .rule // .ruleId // "Unknown"')
+              MESSAGE=$(printf '%s' "$FINDING" |
+                jq -r '.message // .description // ""')
+              FILE=$(printf '%s' "$FINDING" |
+                jq -r '.fileName // .file // .uri // ""')
+              LINE=$(printf '%s' "$FINDING" |
+                jq -r '.line // .lineNumber // ""')
+
+              RULE=$(html_escape "$RULE")
+              MESSAGE=$(html_escape "$MESSAGE")
+              FILE=$(html_escape "$FILE")
 
               printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
-                "$SEVERITY" "$RULE" "$ESCAPED" "$FILE" "$LINE" \
+                "$SEVERITY" "$RULE" "$MESSAGE" "$FILE" "$LINE" \
                 >> pmd-output/pmd-summary.html
-            done
 
-            echo '</table></body></html>' >> pmd-output/pmd-summary.html
+            done < <(jq -c '.[]' pmd-output/classified.json)
 
+            echo '</table></body></html>' \
+              >> pmd-output/pmd-summary.html
+
+            # Export values for the following quality-gate step.
             {
               echo "export PMD_SCAN_STATUS='${SCAN_STATUS}'"
               echo "export PMD_HIGH_COUNT='${HIGH_COUNT}'"
@@ -369,7 +404,13 @@ jobs:
               echo "export PMD_LOW_COUNT='${LOW_COUNT}'"
             } >> "$BASH_ENV"
 
-            echo "PMD scan completed with status ${SCAN_STATUS}"
+            echo "PMD scan exit code: ${SCAN_STATUS}"
+
+            if [ "$SCAN_STATUS" -ne 0 ]; then
+              echo "PMD scan failed or exceeded the configured severity threshold."
+            else
+              echo "PMD scan completed successfully."
+            fi
 
       # -----------------------------------------------
       # 5. ENFORCE PMD QUALITY GATE
