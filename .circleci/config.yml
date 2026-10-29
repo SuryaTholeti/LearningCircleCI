@@ -39,9 +39,21 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y jq
 
+            # Allow trusted unsigned plugins in CircleCI.
+            mkdir -p "$HOME/.config/sf"
+
+            cat > "$HOME/.config/sf/unsignedPluginAllowList.json" <<'EOF'
+            [
+              "sfdx-git-delta",
+              "@salesforce/sfdx-scanner"
+            ]
+            EOF
+
+            # Install plugins without interactive prompts.
             sf plugins install sfdx-git-delta
             sf plugins install @salesforce/sfdx-scanner
 
+            # Verify installation.
             sf --version
             sf plugins
 
@@ -650,4 +662,3 @@ workflows:
           filters:
             branches:
               only: main
-
