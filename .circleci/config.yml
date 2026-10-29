@@ -29,30 +29,43 @@ jobs:
       # -----------------------------------------------
       # 1. INSTALL SALESFORCE CLI AND REQUIRED TOOLS
       # -----------------------------------------------      
+      
       - run:
           name: Install Salesforce CLI and Tools
           command: |
             set -euo pipefail
 
+            # Install Salesforce CLI
             sudo npm install -g @salesforce/cli@2.143.6
 
+            # Install Java and jq
             sudo apt-get update -qq
-            sudo apt-get install -y jq
+            sudo apt-get install -y openjdk-17-jdk jq
 
-            # Configure trusted unsigned plugins.
+            # Configure Java
+            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+            export PATH="$JAVA_HOME/bin:$PATH"
+
+            echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> "$BASH_ENV"
+            echo 'export PATH="$JAVA_HOME/bin:$PATH"' >> "$BASH_ENV"
+
+            # Configure trusted unsigned plugins
             mkdir -p "$HOME/.config/sf"
 
             printf '%s\n' \
-              '["sfdx-git-delta","@salesforce/sfdx-scanner"]' \
+              '["sfdx-git-delta","@salesforce/plugin-code-analyzer"]' \
               > "$HOME/.config/sf/unsignedPluginAllowList.json"
 
-            # Install plugins.
+            # Install required plugins
             sf plugins install sfdx-git-delta
-            sf plugins install @salesforce/sfdx-scanner
+            sf plugins install @salesforce/plugin-code-analyzer
 
-            # Verify installation.
+            # Verify installations
             sf --version
             sf plugins
+            java -version
+            sf code-analyzer --help
+
 
 
       # -----------------------------------------------
