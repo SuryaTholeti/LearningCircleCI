@@ -412,6 +412,7 @@ jobs:
               echo "PMD scan completed successfully."
             fi
 
+      
       # -----------------------------------------------
       # 5. ENFORCE PMD QUALITY GATE
       # -----------------------------------------------
@@ -420,20 +421,34 @@ jobs:
           command: |
             set -euo pipefail
 
-            if [ "${PMD_SCAN_STATUS}" -ne 0 ]; then
-              echo "ERROR: PMD scanner failed."
+            echo "PMD scan status: ${PMD_SCAN_STATUS:-not set}"
+            echo "High severity: ${PMD_HIGH_COUNT:-not set}"
+            echo "Medium severity: ${PMD_MEDIUM_COUNT:-not set}"
+            echo "Low severity: ${PMD_LOW_COUNT:-not set}"
+
+            echo "===== PMD REPORT FILES ====="
+            ls -lah pmd-output || true
+
+            echo "===== SCANNER JSON REPORT ====="
+            if [ -f pmd-output/pmd-report.json ]; then
+              jq '.' pmd-output/pmd-report.json || true
+            else
+              echo "JSON report not found."
+            fi
+
+            if [ "${PMD_SCAN_STATUS:-1}" -ne 0 ]; then
+              echo "ERROR: PMD scanner failed or exceeded its severity threshold."
+              echo "Review the PMD scan step and its generated report."
               exit 1
             fi
 
-            if [ "${PMD_HIGH_COUNT}" -gt 0 ]; then
-              echo "ERROR: High-severity PMD violations detected."
+            if [ "${PMD_HIGH_COUNT:-0}" -gt 0 ]; then
+              echo "ERROR: High-severity violations detected."
               exit 1
             fi
 
             echo "PMD quality gate passed."
-            echo "High: ${PMD_HIGH_COUNT}"
-            echo "Medium: ${PMD_MEDIUM_COUNT}"
-            echo "Low: ${PMD_LOW_COUNT}"
+
 
       # -----------------------------------------------
       # 6. AUTHENTICATE TO THE TARGET ORG
