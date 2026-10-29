@@ -223,12 +223,10 @@ jobs:
 
             echo "HAS_DELTA=${HAS_DELTA}"
             echo "HAS_CHANGES=${HAS_CHANGES}"
-
-      
       
       
       # -----------------------------------------------
-      # 4. PMD SCAN, COLOR-CODED REPORT AND QUALITY GATE
+      # 4. PMD SCAN, REPORT AND QUALITY GATE
       # -----------------------------------------------
       - run:
           name: PMD Scan, Severity Report and Quality Gate
@@ -242,12 +240,8 @@ jobs:
             FULL_PATH="force-app/main/default"
             SCAN_STATUS=0
             PARSE_STATUS=0
-            TARGET_PATH=""
-            SCAN_MODE=""
 
-            # -----------------------------------------
-            # Select delta scan or full scan
-            # -----------------------------------------
+            # Select delta or full scan
             if [ -d "$DELTA_PATH" ] && find "$DELTA_PATH" -type f \( -name "*.cls" -o -name "*.trigger" -o -name "*.js" -o -name "*.html" -o -name "*.css" -o -name "*.cmp" -o -name "*.app" -o -name "*.evt" -o -name "*.intf" \) -print -quit | grep -q .; then
               TARGET_PATH="$DELTA_PATH"
               SCAN_MODE="Delta Scan"
@@ -256,7 +250,6 @@ jobs:
               SCAN_MODE="Full Scan"
             else
               echo "ERROR: Salesforce source directory not found."
-              echo "Expected: $DELTA_PATH or $FULL_PATH"
               exit 1
             fi
 
@@ -266,16 +259,12 @@ jobs:
             echo "Scan target : $TARGET_PATH"
             echo "============================================"
 
-            # -----------------------------------------
-            # Run Salesforce Code Analyzer v5
-            # -----------------------------------------
+            # Run PMD using Salesforce Code Analyzer
             sf code-analyzer run --rule-selector pmd --workspace "$TARGET_PATH" --output-file pmd-output/pmd-report.json 2>&1 | tee pmd-output/scanner.log
             SCAN_STATUS=${PIPESTATUS[0]}
             echo "Scanner exit code: $SCAN_STATUS"
 
-            # -----------------------------------------
-            # Validate JSON report
-            # -----------------------------------------
+            # Validate scanner JSON
             if [ ! -s pmd-output/pmd-report.json ]; then
               echo "ERROR: Scanner did not generate a JSON report."
               PARSE_STATUS=1
@@ -286,12 +275,10 @@ jobs:
               printf '{"violations":[]}\n' > pmd-output/pmd-report.json
             fi
 
-            # -----------------------------------------
-            # Normalize report structures
-            # -----------------------------------------
+            # Normalize Code Analyzer findings
             if [ "$PARSE_STATUS" -eq 0 ]; then
               if ! jq 'if type == "array" then [.[] | if type == "object" and (.violations | type == "array") then .violations[] else . end] elif type == "object" and (.violations | type == "array") then .violations else error("Unrecognized report structure") end | map(select(type == "object"))' pmd-output/pmd-report.json > pmd-output/findings.json; then
-                echo "ERROR: Unable to parse report findings."
+                echo "ERROR: Unable to parse scanner findings."
                 PARSE_STATUS=1
                 printf '[]\n' > pmd-output/findings.json
               fi
@@ -299,10 +286,7 @@ jobs:
               printf '[]\n' > pmd-output/findings.json
             fi
 
-            # -----------------------------------------
-            # Classify High, Medium, Low and Unknown
-            # PMD priorities: 1-2 High, 3 Medium, 4-5 Low
-            # -----------------------------------------
+            # Classify PMD severity in a single-line jq expression
             if [ "$PARSE_STATUS" -eq 0 ]; then
               if ! jq 'map(. as $v | (($v.severity // $v.priority // $v.ruleSeverity // "unknown") | tostring | ascii_downcase) as $s | $v + {pipelineSeverity: (if ($s == "1" or $s == "2" or $s == "high" or $s == "critical" or $s == "error") then "High" elif ($s == "3" or $s == "medium" or $s == "moderate" or $s == "warning") then "Medium" elif ($s == "4" or $s == "5" or $s == "low" or $s == "info" or $s == "informational") then "Low" else "Unknown" end)})' pmd-output/findings.json > pmd-output/classified.json; then
                 echo "ERROR: Severity classification failed."
@@ -313,18 +297,14 @@ jobs:
               printf '[]\n' > pmd-output/classified.json
             fi
 
-            # -----------------------------------------
-            # Calculate severity totals
-            # -----------------------------------------
+            # Count findings
             HIGH_COUNT=$(jq '[.[] | select(.pipelineSeverity == "High")] | length' pmd-output/classified.json)
             MEDIUM_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Medium")] | length' pmd-output/classified.json)
             LOW_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Low")] | length' pmd-output/classified.json)
             UNKNOWN_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Unknown")] | length' pmd-output/classified.json)
             TOTAL_COUNT=$(jq 'length' pmd-output/classified.json)
 
-            # -----------------------------------------
-            # Console summary with colors
-            # -----------------------------------------
+            # Color-coded console summary
             RED='\033[0;31m'
             YELLOW='\033[0;33m'
             GREEN='\033[0;32m'
@@ -342,14 +322,17 @@ jobs:
             printf "Total findings   : %s\n" "$TOTAL_COUNT"
             echo "============================================"
 
-            # -----------------------------------------
-            # HTML report header and severity cards
-            # -----------------------------------------
+            # HTML escaping helper
+            html_escape() {
+              printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+            }
+
+            # Generate HTML report
             {
               echo '<!doctype html>'
               echo '<html><head><meta charset="utf-8">'
               echo '<meta name="viewport" content="width=device-width, initial-scale=1">'
-              echo '<title>Salesforce PMD Report</title>'
+              echo '<title>Salesforce PMD Scan Report</title>'
               echo '<style>'
               echo 'body{font-family:Arial,sans-serif;margin:24px;color:#222}'
               echo '.card{display:inline-block;padding:16px;margin:6px;border-radius:8px;color:white;font-weight:bold}'
@@ -372,43 +355,24 @@ jobs:
               echo '<table><thead><tr><th>Severity</th><th>Rule</th><th>Message</th><th>Apex Class / File</th><th>Line</th><th>Column</th><th>Documentation</th></tr></thead><tbody>'
             } > pmd-output/pmd-summary.html
 
-            # -----------------------------------------
-            # HTML escape helper
-            # -----------------------------------------
-            html_escape() {
-              printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"
-            }
-
-            # -----------------------------------------
-            # Extract finding details and build table
-            # Supports common direct, nested and SARIF fields
-            # -----------------------------------------
+            # Read each normalized finding
             while IFS= read -r FINDING; do
               SEVERITY=$(printf '%s' "$FINDING" | jq -r '.pipelineSeverity // "Unknown"')
-              RULE=$(printf '%s' "$FINDING" | jq -r '.ruleName // .rule // .ruleId // .engineDetails.ruleName // .rule.name // "Unknown"')
-              MESSAGE=$(printf '%s' "$FINDING" | jq -r '.message // .description // .primaryLocation.message // .locations[0].message // ""')
+              RULE=$(printf '%s' "$FINDING" | jq -r '.rule // .ruleName // .ruleId // "Unknown"')
+              MESSAGE=$(printf '%s' "$FINDING" | jq -r '.message // .description // ""')
 
-              FILE=$(printf '%s' "$FINDING" | jq -r '[.fileName, .file, .uri, .sourcePath, .location.file, .location.uri, .primaryLocation.file, .primaryLocation.uri, .primaryLocation.physicalLocation.artifactLocation.uri, .locations[0].physicalLocation.artifactLocation.uri, .codeLocations[0].fileName, .codeLocations[0].uri, .primaryLocation.sourceFile] | map(select(type == "string" and length > 0)) | .[0] // ""')
-
-              LINE=$(printf '%s' "$FINDING" | jq -r '[.line, .lineNumber, .startLine, .location.startLine, .location.startLineNumber, .location.physicalLocation.region.startLine, .primaryLocation.region.startLine, .primaryLocation.physicalLocation.region.startLine, .locations[0].physicalLocation.region.startLine, .codeLocations[0].lineNumber, .codeLocations[0].startLine] | map(select(. != null and . != "")) | .[0] // ""')
-
-              COLUMN=$(printf '%s' "$FINDING" | jq -r '[.column, .columnNumber, .startColumn, .location.startColumn, .location.physicalLocation.region.startColumn, .primaryLocation.region.startColumn, .primaryLocation.physicalLocation.region.startColumn, .locations[0].physicalLocation.region.startColumn, .codeLocations[0].columnNumber, .codeLocations[0].startColumn] | map(select(. != null and . != "")) | .[0] // ""')
-
-              # Some formats use a URI or message text inside nested objects.
-              if [ -z "$FILE" ]; then
-                FILE=$(printf '%s' "$FINDING" | jq -r '.locations[0].fileName // .location.fileName // .primaryLocation.fileName // ""')
-              fi
+              # Actual Code Analyzer location structure: locations[].file/startLine/startColumn
+              FILE=$(printf '%s' "$FINDING" | jq -r '.locations[0].file // .fileName // .file // .uri // .sourcePath // "Location unavailable"')
+              LINE=$(printf '%s' "$FINDING" | jq -r '.locations[0].startLine // .line // .lineNumber // .startLine // "N/A"')
+              COLUMN=$(printf '%s' "$FINDING" | jq -r '.locations[0].startColumn // .column // .columnNumber // .startColumn // "N/A"')
 
               FILE_NAME="${FILE##*/}"
-              if [ -n "$FILE" ]; then
+              if [ "$FILE" != "Location unavailable" ] && [ -n "$FILE_NAME" ]; then
                 APEX_CLASS="${FILE_NAME%.cls}"
               else
-                FILE_NAME="Location unavailable"
                 APEX_CLASS="Location unavailable"
+                FILE_NAME="Location unavailable"
               fi
-
-              [ -z "$LINE" ] && LINE="N/A"
-              [ -z "$COLUMN" ] && COLUMN="N/A"
 
               RULE=$(html_escape "$RULE")
               MESSAGE=$(html_escape "$MESSAGE")
@@ -422,18 +386,15 @@ jobs:
                 *) CSS_CLASS="" ;;
               esac
 
-              # Rule-specific documentation links.
-              case "$RULE" in
-                ApexCRUDViolation)
-                  DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_security.html"
-                  ;;
-                ApexUnitTestClassShouldHaveRunAs)
-                  DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_bestpractices.html"
-                  ;;
-                *)
-                  DOC_URL="https://docs.pmd-code.org/latest/"
-                  ;;
-              esac
+              # Prefer the direct documentation URL included in the finding.
+              DOC_URL=$(printf '%s' "$FINDING" | jq -r '.resources[0] // .url // ""')
+              if [ -z "$DOC_URL" ]; then
+                case "$RULE" in
+                  ApexCRUDViolation) DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_security.html#apexcrudviolation" ;;
+                  ApexUnitTestClassShouldHaveRunAs) DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_bestpractices.html#apexunittestclassshouldhaverunas" ;;
+                  *) DOC_URL="https://docs.pmd-code.org/latest/" ;;
+                esac
+              fi
 
               printf '<tr><td class="%s">%s</td><td>%s</td><td>%s</td><td><strong>%s</strong><br><small><code>%s</code></small></td><td>%s</td><td>%s</td><td><a href="%s" target="_blank" rel="noopener noreferrer">View documentation</a></td></tr>\n' \
                 "$CSS_CLASS" "$SEVERITY" "$RULE" "$MESSAGE" "$APEX_CLASS" "$FILE_NAME" "$LINE" "$COLUMN" "$DOC_URL" \
@@ -447,21 +408,14 @@ jobs:
               echo '</body></html>'
             } >> pmd-output/pmd-summary.html
 
-            # -----------------------------------------
-            # Print raw finding structure if locations
-            # are unavailable for troubleshooting
-            # -----------------------------------------
+            # Save useful diagnostic details
             if grep -q 'Location unavailable' pmd-output/pmd-summary.html; then
-              echo "WARNING: One or more findings have no recognized source path."
-              echo "Inspect pmd-output/findings.json to identify the actual location fields."
+              echo "WARNING: Some findings have no recognized source path."
+              echo "First normalized finding:"
               jq '.[0]' pmd-output/findings.json || true
             fi
 
-            # -----------------------------------------
-            # Quality gate
-            # Fail on scanner errors, parsing errors,
-            # unknown severities or High findings.
-            # -----------------------------------------
+            # Combined quality gate
             echo ""
             echo "============================================"
             echo "             PMD QUALITY GATE"
@@ -472,7 +426,7 @@ jobs:
             elif [ "$PARSE_STATUS" -ne 0 ]; then
               echo "FAILED: PMD report could not be parsed."
             elif [ "$UNKNOWN_COUNT" -gt 0 ]; then
-              echo "FAILED: Findings have unrecognized severity."
+              echo "FAILED: Unknown severity findings detected."
             elif [ "$HIGH_COUNT" -gt 0 ]; then
               echo "FAILED: High-severity findings detected."
             else
@@ -493,13 +447,6 @@ jobs:
             fi
 
             exit 0
-
-      # -----------------------------------------------
-      # 5. PUBLISH PMD REPORTS
-      # -----------------------------------------------
-      - store_artifacts:
-          path: pmd-output
-          destination: salesforce-pmd-report
 
       # -----------------------------------------------
       #  5. Publish PMD reports as CircleCI artifacts
@@ -789,7 +736,6 @@ workflows:
           filters:
             branches:
               only: main
-
 
 
               
