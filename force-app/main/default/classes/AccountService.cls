@@ -1,10 +1,10 @@
 /**
  * @description Service class for handling Account business logic.
- *              Compliant with PMD rules (braces, bulkification, naming).
+ *              Enforces WITH USER_MODE to resolve ApexCRUDViolation PMD errors.
  */
 public inherited sharing class AccountService {
   /**
-   * @description Updates the description of a list of accounts.
+   * @description Updates the description of a list of accounts in User Mode.
    * @param accountIds List of Account IDs to update.
    * @param newDescription Description string to apply.
    */
@@ -16,11 +16,12 @@ public inherited sharing class AccountService {
       return;
     }
 
-    // PMD Rule: Avoid DML statements inside loops - perform bulk DML operations.
+    // Fix 1: Added WITH USER_MODE to enforce running user's CRUD/FLS permissions on SOQL
     List<Account> accountsToUpdate = [
       SELECT Id, Description
       FROM Account
       WHERE Id IN :accountIds
+      WITH USER_MODE
     ];
 
     if (accountsToUpdate.isEmpty()) {
@@ -31,7 +32,7 @@ public inherited sharing class AccountService {
       acc.Description = newDescription;
     }
 
-    // Safe bulk update
-    update accountsToUpdate;
+    // Fix 2: Added 'AS USER' to enforce user mode on DML operations
+    update as user accountsToUpdate;
   }
 }
