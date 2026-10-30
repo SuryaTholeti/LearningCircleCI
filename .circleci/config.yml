@@ -3,14 +3,20 @@ version: 2.1
 jobs:
   deploy:
     parameters:
+      username:
+        type: env_var_name
+      client_id:
+        type: env_var_name
+      instance_url:
+        type: env_var_name
+      jwt_key:
+        type: env_var_name
       environment:
         type: enum
         enum: ["auto", "qa", "uat", "prod"]
       mode:
         type: enum
         enum: ["validate", "deploy"]
-      test_level:
-        type: string
 
     docker:
       - image: cimg/node:22.17
@@ -20,251 +26,687 @@ jobs:
     steps:
       - checkout
 
-      - run:
-          name: Install Salesforce CLI and tools
-          command: |
-            set -euo pipefail
-            sudo npm install --global @salesforce/cli@2.143.6
-            sudo apt-get update && sudo apt-get install --yes jq
-            echo y | sf plugins install sfdx-git-delta
-            echo y | sf plugins install @salesforce/sfdx-scanner
-            sf --version
+      # -----------------------------------------------
+      # 1. INSTALL SALESFORCE CLI AND REQUIRED TOOLS
+      # -----------------------------------------------
 
       - run:
-          name: Resolve Target Branch and Environment
+          name: Install Salesforce CLI and Tools
           command: |
             set -euo pipefail
+
+            # Install Salesforce CLI
+            sudo npm install -g @salesforce/cli@2.143.6
+
+            # Install Java and jq
+            sudo apt-get update -qq
+            sudo apt-get install -y openjdk-17-jdk jq
+
+            # Configure Java
+            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+            export PATH="$JAVA_HOME/bin:$PATH"
+
+            echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> "$BASH_ENV"
+            echo 'export PATH="$JAVA_HOME/bin:$PATH"' >> "$BASH_ENV"
+
+            # Configure trusted unsigned plugins
+            mkdir -p "$HOME/.config/sf"
+
+            printf '%s\n' \
+              '["sfdx-git-delta","@salesforce/plugin-code-analyzer"]' \
+              > "$HOME/.config/sf/unsignedPluginAllowList.json"
+
+            # Install required plugins
+            sf plugins install sfdx-git-delta
+            sf plugins install @salesforce/plugin-code-analyzer
+
+            # Verify installations
+            sf --version
+            sf plugins
+            java -version
+            sf code-analyzer --help
+
+      # -----------------------------------------------
+      # 2. RESOLVE TARGET ENVIRONMENT
+      # -----------------------------------------------
+      - run:
+          name: Resolve Target Environment
+          command: |
+            set -euo pipefail
+
             MODE="<< parameters.mode >>"
             ENVIRONMENT="<< parameters.environment >>"
-            IS_PR="false"
 
-            if [ "$MODE" = "validate" ] && [ "$ENVIRONMENT" = "auto" ]; then
-              : "${CIRCLE_PULL_REQUEST:?PR URL is required for validation}"
-              : "${GH_API_TOKEN:?Set GH_API_TOKEN in CircleCI}"
+            IS_PR="false"
+            BASE_BRANCH=""
+
+            if [ "$MODE" = "validate" ] &&
+               [ "$ENVIRONMENT" = "auto" ]; then
+
+              if [ -z "${CIRCLE_PULL_REQUEST:-}" ]; then
+                echo "ERROR: A pull request URL is required for auto validation."
+                echo "Ensure CircleCI is configured to build pull requests."
+                exit 1
+              fi
+
+              if [ -z "${GH_API_TOKEN:-}" ]; then
+                echo "ERROR: GH_API_TOKEN is not configured."
+                exit 1
+              fi
+
               PR_NUMBER="${CIRCLE_PULL_REQUEST##*/}"
-              PR_DATA=$(curl --fail --silent --show-error -H "Authorization: Bearer ${GH_API_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls/${PR_NUMBER}")
-              BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.base.ref')
-              IS_PR="true"
+
+              PR_JSON=$(curl -fsSL \
+                -H "Authorization: Bearer ${GH_API_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls/${PR_NUMBER}")
+
+              BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
+
               case "$BASE_BRANCH" in
-                qa|QA) ENVIRONMENT="qa" ;;
-                uat|UAT) ENVIRONMENT="uat" ;;
-                main) ENVIRONMENT="prod" ;;
-                *) echo "Unsupported PR target: $BASE_BRANCH"; exit 1 ;;
+                qa|uat|main)
+                  IS_PR="true"
+                  ;;
+                *)
+                  echo "PR targets '${BASE_BRANCH}'."
+                  echo "This pipeline validates only PRs targeting qa, uat, or main."
+                  exit 0
+                  ;;
               esac
+
+              case "$BASE_BRANCH" in
+                qa) ENVIRONMENT="qa" ;;
+                uat) ENVIRONMENT="uat" ;;
+                main) ENVIRONMENT="prod" ;;
+              esac
+
             else
               case "$ENVIRONMENT" in
                 qa) BASE_BRANCH="qa" ;;
                 uat) BASE_BRANCH="uat" ;;
                 prod) BASE_BRANCH="main" ;;
-                *) echo "Unsupported environment: $ENVIRONMENT"; exit 1 ;;
+                *)
+                  echo "ERROR: Unsupported environment: $ENVIRONMENT"
+                  exit 1
+                  ;;
               esac
             fi
 
-            echo "export PIPELINE_MODE='$MODE'" >> "$BASH_ENV"
-            echo "export TARGET_ENVIRONMENT='$ENVIRONMENT'" >> "$BASH_ENV"
-            echo "export BASE_BRANCH='$BASE_BRANCH'" >> "$BASH_ENV"
-            echo "export IS_PR='$IS_PR'" >> "$BASH_ENV"
-            echo "Target branch: $BASE_BRANCH; environment: $ENVIRONMENT; mode: $MODE"
+            {
+              echo "export PIPELINE_MODE='${MODE}'"
+              echo "export TARGET_ENVIRONMENT='${ENVIRONMENT}'"
+              echo "export BASE_BRANCH='${BASE_BRANCH}'"
+              echo "export IS_PR='${IS_PR}'"
+            } >> "$BASH_ENV"
 
+            echo "Pipeline mode: ${MODE}"
+            echo "Target environment: ${ENVIRONMENT}"
+            echo "Base branch: ${BASE_BRANCH}"
+            echo "Pull request validation: ${IS_PR}"
+
+      # -----------------------------------------------
+      # 3. FETCH HISTORY AND GENERATE DELTA
+      # -----------------------------------------------
       - run:
-          name: Fetch Git History and Generate Delta
+          name: Generate Salesforce Delta
           command: |
             set -euo pipefail
-            source "$BASH_ENV"
+
+            mkdir -p delta
+
             git fetch origin --prune
-            git fetch --unshallow 2>/dev/null || true
-            git fetch origin "$BASE_BRANCH" --depth=100
 
-            if [ -n "${COMMIT_ID:-}" ]; then
-              FROM_COMMIT="$COMMIT_ID"
-            elif [ "$IS_PR" = "true" ]; then
-              FROM_COMMIT=$(git merge-base HEAD "origin/$BASE_BRANCH")
-            else
-              FROM_COMMIT=$(git rev-parse HEAD^ 2>/dev/null || true)
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              git fetch --unshallow origin
             fi
 
-            if [ -z "${FROM_COMMIT:-}" ]; then echo "Unable to determine delta baseline."; exit 1; fi
-            echo "export FROM_COMMIT='$FROM_COMMIT'" >> "$BASH_ENV"
-            rm -rf delta && mkdir -p delta reports
+            if [ "$IS_PR" = "true" ]; then
+              git fetch origin "$BASE_BRANCH"
 
-            sf sgd source delta --from "$FROM_COMMIT" --to HEAD --output-dir delta --generate-delta
-
-            CHANGED_FILES=$(git diff --name-only "$FROM_COMMIT" HEAD -- | grep '^force-app/' || true)
-            echo "$CHANGED_FILES" > reports/changed-files.txt
-
-            if [ -f delta/package/package.xml ] && grep -q '<members>' delta/package/package.xml; then
-              echo "export HAS_DELTA=true" >> "$BASH_ENV"
-              cp delta/package/package.xml reports/delta-package.xml
+              FROM_COMMIT=$(git merge-base HEAD "origin/${BASE_BRANCH}")
             else
-              echo "export HAS_DELTA=false" >> "$BASH_ENV"
+              if ! git rev-parse HEAD^ >/dev/null 2>&1; then
+                echo "No previous commit exists. No delta can be generated."
+                echo "export HAS_DELTA=false" >> "$BASH_ENV"
+                echo "export HAS_CHANGES=false" >> "$BASH_ENV"
+                exit 0
+              fi
+
+              FROM_COMMIT="HEAD^"
             fi
 
-            mkdir -p delta/destructiveChanges
-            for FILE in preDestructiveChanges.xml postDestructiveChanges.xml; do
-              if [ -f "destructiveChanges/$FILE" ]; then cp "destructiveChanges/$FILE" "delta/destructiveChanges/$FILE"; fi
+            echo "Comparing ${FROM_COMMIT} with HEAD"
+
+            sf sgd source delta \
+              --from "$FROM_COMMIT" \
+              --to HEAD \
+              --output-dir delta \
+              --source-dir force-app/main/default \
+              --generate-delta
+
+            echo "===== GENERATED PACKAGE.XML ====="
+
+            if [ -f delta/package/package.xml ]; then
+              cat delta/package/package.xml
+            else
+              echo "No package.xml generated."
+            fi
+
+            HAS_DELTA="false"
+            HAS_CHANGES="false"
+
+            if [ -f delta/package/package.xml ] &&
+               grep -q "<members>" delta/package/package.xml; then
+              HAS_DELTA="true"
+              HAS_CHANGES="true"
+            fi
+
+            # Check whether destructive change manifests were generated.
+            for FILE in \
+              delta/destructiveChanges/destructiveChanges.xml \
+              delta/destructiveChanges/destructiveChangesPre.xml \
+              delta/destructiveChanges/destructiveChangesPost.xml \
+              delta/destructiveChanges/preDestructiveChanges.xml \
+              delta/destructiveChanges/postDestructiveChanges.xml
+            do
+              if [ -f "$FILE" ]; then
+                HAS_CHANGES="true"
+              fi
             done
 
-            if [ -f delta/destructiveChanges/destructiveChanges.xml ] && [ ! -f delta/destructiveChanges/postDestructiveChanges.xml ]; then cp delta/destructiveChanges/destructiveChanges.xml delta/destructiveChanges/postDestructiveChanges.xml; fi
+            {
+              echo "export HAS_DELTA='${HAS_DELTA}'"
+              echo "export HAS_CHANGES='${HAS_CHANGES}'"
+            } >> "$BASH_ENV"
 
-            if [ -f delta/destructiveChanges/preDestructiveChanges.xml ] || [ -f delta/destructiveChanges/postDestructiveChanges.xml ]; then
-              echo "export HAS_DESTRUCTIVE=true" >> "$BASH_ENV"
-            else
-              echo "export HAS_DESTRUCTIVE=false" >> "$BASH_ENV"
-            fi
+            echo "HAS_DELTA=${HAS_DELTA}"
+            echo "HAS_CHANGES=${HAS_CHANGES}"
 
-            if [ -n "$CHANGED_FILES" ]; then echo "export HAS_CHANGED_FILES=true" >> "$BASH_ENV"; else echo "export HAS_CHANGED_FILES=false" >> "$BASH_ENV"; fi
-            echo "===== DELTA PACKAGE ====="
-            cat delta/package/package.xml 2>/dev/null || true
-            echo "===== CHANGED FILES ====="
-            cat reports/changed-files.txt
-
+      # -----------------------------------------------
+      # 4. PMD SCAN, REPORT AND QUALITY GATE
+      # -----------------------------------------------
       - run:
-          name: Salesforce PMD Scan
+          name: PMD Scan, Severity Report and Quality Gate
           command: |
             set -uo pipefail
-            source "$BASH_ENV"
+
             mkdir -p pmd-output
+            rm -f pmd-output/pmd-report.json pmd-output/pmd-summary.html pmd-output/findings.json pmd-output/classified.json pmd-output/scanner.log
 
             DELTA_PATH="delta/force-app/main/default"
-            if [ "${HAS_DELTA:-false}" = "true" ] && [ -d "$DELTA_PATH" ] && find "$DELTA_PATH" -type f | grep -q .; then
+            FULL_PATH="force-app/main/default"
+            SCAN_STATUS=0
+            PARSE_STATUS=0
+
+            # Select delta or full scan
+            if [ -d "$DELTA_PATH" ] && find "$DELTA_PATH" -type f \( -name "*.cls" -o -name "*.trigger" -o -name "*.js" -o -name "*.html" -o -name "*.css" -o -name "*.cmp" -o -name "*.app" -o -name "*.evt" -o -name "*.intf" \) -print -quit | grep -q .; then
               TARGET_PATH="$DELTA_PATH"
-              echo "Running PMD on delta metadata."
+              SCAN_MODE="Delta Scan"
+            elif [ -d "$FULL_PATH" ]; then
+              TARGET_PATH="$FULL_PATH"
+              SCAN_MODE="Full Scan"
             else
-              TARGET_PATH="force-app/main/default"
-              echo "Running PMD on the full source directory."
+              echo "ERROR: Salesforce source directory not found."
+              exit 1
             fi
 
-            SCAN_STATUS=0
-            sf scanner run --engine pmd --target "$TARGET_PATH" --format json --outfile pmd-output/pmd-report.json --severity-threshold 3 || SCAN_STATUS=$?
-            HTML_STATUS=0
-            sf scanner run --engine pmd --target "$TARGET_PATH" --format html --outfile pmd-output/pmd-report.html --severity-threshold 3 || HTML_STATUS=$?
+            echo "============================================"
+            echo "Salesforce Code Analyzer - PMD"
+            echo "Scan mode   : $SCAN_MODE"
+            echo "Scan target : $TARGET_PATH"
+            echo "============================================"
 
-            if [ "$SCAN_STATUS" -eq 0 ] && [ "$HTML_STATUS" -ne 0 ]; then SCAN_STATUS="$HTML_STATUS"; fi
-            echo "export PMD_SCAN_STATUS='$SCAN_STATUS'" >> "$BASH_ENV"
-            echo "PMD scan exit status: $SCAN_STATUS"
+            # Run PMD using Salesforce Code Analyzer
+            sf code-analyzer run --rule-selector pmd --workspace "$TARGET_PATH" --output-file pmd-output/pmd-report.json 2>&1 | tee pmd-output/scanner.log
+            SCAN_STATUS=${PIPESTATUS[0]}
+            echo "Scanner exit code: $SCAN_STATUS"
 
+            # Validate scanner JSON
+            if [ ! -s pmd-output/pmd-report.json ]; then
+              echo "ERROR: Scanner did not generate a JSON report."
+              PARSE_STATUS=1
+              printf '{"violations":[]}\n' > pmd-output/pmd-report.json
+            elif ! jq -e . pmd-output/pmd-report.json >/dev/null 2>&1; then
+              echo "ERROR: Scanner report is invalid JSON."
+              PARSE_STATUS=1
+              printf '{"violations":[]}\n' > pmd-output/pmd-report.json
+            fi
+
+            # Normalize Code Analyzer findings
+            if [ "$PARSE_STATUS" -eq 0 ]; then
+              if ! jq 'if type == "array" then [.[] | if type == "object" and (.violations | type == "array") then .violations[] else . end] elif type == "object" and (.violations | type == "array") then .violations else error("Unrecognized report structure") end | map(select(type == "object"))' pmd-output/pmd-report.json > pmd-output/findings.json; then
+                echo "ERROR: Unable to parse scanner findings."
+                PARSE_STATUS=1
+                printf '[]\n' > pmd-output/findings.json
+              fi
+            else
+              printf '[]\n' > pmd-output/findings.json
+            fi
+
+            # Classify PMD severity in a single-line jq expression
+            if [ "$PARSE_STATUS" -eq 0 ]; then
+              if ! jq 'map(. as $v | (($v.severity // $v.priority // $v.ruleSeverity // "unknown") | tostring | ascii_downcase) as $s | $v + {pipelineSeverity: (if ($s == "1" or $s == "2" or $s == "high" or $s == "critical" or $s == "error") then "High" elif ($s == "3" or $s == "medium" or $s == "moderate" or $s == "warning") then "Medium" elif ($s == "4" or $s == "5" or $s == "low" or $s == "info" or $s == "informational") then "Low" else "Unknown" end)})' pmd-output/findings.json > pmd-output/classified.json; then
+                echo "ERROR: Severity classification failed."
+                PARSE_STATUS=1
+                printf '[]\n' > pmd-output/classified.json
+              fi
+            else
+              printf '[]\n' > pmd-output/classified.json
+            fi
+
+            # Count findings
+            HIGH_COUNT=$(jq '[.[] | select(.pipelineSeverity == "High")] | length' pmd-output/classified.json)
+            MEDIUM_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Medium")] | length' pmd-output/classified.json)
+            LOW_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Low")] | length' pmd-output/classified.json)
+            UNKNOWN_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Unknown")] | length' pmd-output/classified.json)
+            TOTAL_COUNT=$(jq 'length' pmd-output/classified.json)
+
+            # Color-coded console summary
+            RED='\033[0;31m'
+            YELLOW='\033[0;33m'
+            GREEN='\033[0;32m'
+            RESET='\033[0m'
+
+            echo ""
+            echo "============================================"
+            echo "             PMD SUMMARY"
+            echo "============================================"
+            printf "Scan mode        : %s\n" "$SCAN_MODE"
+            printf "High severity    : ${RED}%s${RESET}\n" "$HIGH_COUNT"
+            printf "Medium severity  : ${YELLOW}%s${RESET}\n" "$MEDIUM_COUNT"
+            printf "Low severity     : ${GREEN}%s${RESET}\n" "$LOW_COUNT"
+            printf "Unknown severity : %s\n" "$UNKNOWN_COUNT"
+            printf "Total findings   : %s\n" "$TOTAL_COUNT"
+            echo "============================================"
+
+            # HTML escaping helper
+            html_escape() {
+              printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+            }
+
+            # Generate HTML report
+            {
+              echo '<!doctype html>'
+              echo '<html><head><meta charset="utf-8">'
+              echo '<meta name="viewport" content="width=device-width, initial-scale=1">'
+              echo '<title>Salesforce PMD Scan Report</title>'
+              echo '<style>'
+              echo 'body{font-family:Arial,sans-serif;margin:24px;color:#222}'
+              echo '.card{display:inline-block;padding:16px;margin:6px;border-radius:8px;color:white;font-weight:bold}'
+              echo '.high{background:#c62828}.medium{background:#f9a825;color:#222}.low{background:#2e7d32}.unknown{background:#616161}'
+              echo 'table{border-collapse:collapse;width:100%;margin-top:20px}'
+              echo 'td,th{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}'
+              echo 'th{background:#f2f2f2}'
+              echo '.severity-high{color:#c62828;font-weight:bold}'
+              echo '.severity-medium{color:#9a6700;font-weight:bold}'
+              echo '.severity-low{color:#2e7d32;font-weight:bold}'
+              echo 'code{overflow-wrap:anywhere}'
+              echo '</style></head><body>'
+              echo '<h1>Salesforce PMD Scan Report</h1>'
+              printf '<p><strong>Scan mode:</strong> %s</p>\n' "$SCAN_MODE"
+              printf '<p><strong>Scan target:</strong> %s</p>\n' "$TARGET_PATH"
+              printf '<div class="card high">High: %s</div>\n' "$HIGH_COUNT"
+              printf '<div class="card medium">Medium: %s</div>\n' "$MEDIUM_COUNT"
+              printf '<div class="card low">Low: %s</div>\n' "$LOW_COUNT"
+              printf '<div class="card unknown">Unknown: %s</div>\n' "$UNKNOWN_COUNT"
+              echo '<table><thead><tr><th>Severity</th><th>Rule</th><th>Message</th><th>Apex Class / File</th><th>Line</th><th>Column</th><th>Documentation</th></tr></thead><tbody>'
+            } > pmd-output/pmd-summary.html
+
+            # Read each normalized finding
+            while IFS= read -r FINDING; do
+              SEVERITY=$(printf '%s' "$FINDING" | jq -r '.pipelineSeverity // "Unknown"')
+              RULE=$(printf '%s' "$FINDING" | jq -r '.rule // .ruleName // .ruleId // "Unknown"')
+              MESSAGE=$(printf '%s' "$FINDING" | jq -r '.message // .description // ""')
+
+              # Actual Code Analyzer location structure: locations[].file/startLine/startColumn
+              FILE=$(printf '%s' "$FINDING" | jq -r '.locations[0].file // .fileName // .file // .uri // .sourcePath // "Location unavailable"')
+              LINE=$(printf '%s' "$FINDING" | jq -r '.locations[0].startLine // .line // .lineNumber // .startLine // "N/A"')
+              COLUMN=$(printf '%s' "$FINDING" | jq -r '.locations[0].startColumn // .column // .columnNumber // .startColumn // "N/A"')
+
+              FILE_NAME="${FILE##*/}"
+              if [ "$FILE" != "Location unavailable" ] && [ -n "$FILE_NAME" ]; then
+                APEX_CLASS="${FILE_NAME%.cls}"
+              else
+                APEX_CLASS="Location unavailable"
+                FILE_NAME="Location unavailable"
+              fi
+
+              RULE=$(html_escape "$RULE")
+              MESSAGE=$(html_escape "$MESSAGE")
+              FILE_NAME=$(html_escape "$FILE_NAME")
+              APEX_CLASS=$(html_escape "$APEX_CLASS")
+
+              case "$SEVERITY" in
+                High) CSS_CLASS="severity-high" ;;
+                Medium) CSS_CLASS="severity-medium" ;;
+                Low) CSS_CLASS="severity-low" ;;
+                *) CSS_CLASS="" ;;
+              esac
+
+              # Prefer the direct documentation URL included in the finding.
+              DOC_URL=$(printf '%s' "$FINDING" | jq -r '.resources[0] // .url // ""')
+              if [ -z "$DOC_URL" ]; then
+                case "$RULE" in
+                  ApexCRUDViolation) DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_security.html#apexcrudviolation" ;;
+                  ApexUnitTestClassShouldHaveRunAs) DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_bestpractices.html#apexunittestclassshouldhaverunas" ;;
+                  *) DOC_URL="https://docs.pmd-code.org/latest/" ;;
+                esac
+              fi
+
+              printf '<tr><td class="%s">%s</td><td>%s</td><td>%s</td><td><strong>%s</strong><br><small><code>%s</code></small></td><td>%s</td><td>%s</td><td><a href="%s" target="_blank" rel="noopener noreferrer">View documentation</a></td></tr>\n' \
+                "$CSS_CLASS" "$SEVERITY" "$RULE" "$MESSAGE" "$APEX_CLASS" "$FILE_NAME" "$LINE" "$COLUMN" "$DOC_URL" \
+                >> pmd-output/pmd-summary.html
+
+            done < <(jq -c '.[]' pmd-output/classified.json)
+
+            {
+              echo '</tbody></table>'
+              echo '<p>Generated by Salesforce Code Analyzer in CircleCI.</p>'
+              echo '</body></html>'
+            } >> pmd-output/pmd-summary.html
+
+            # Save useful diagnostic details
+            if grep -q 'Location unavailable' pmd-output/pmd-summary.html; then
+              echo "WARNING: Some findings have no recognized source path."
+              echo "First normalized finding:"
+              jq '.[0]' pmd-output/findings.json || true
+            fi
+
+            # Combined quality gate
+            echo ""
+            echo "============================================"
+            echo "             PMD QUALITY GATE"
+            echo "============================================"
+
+            if [ "$SCAN_STATUS" -ne 0 ]; then
+              echo "FAILED: Code Analyzer returned an error."
+            elif [ "$PARSE_STATUS" -ne 0 ]; then
+              echo "FAILED: PMD report could not be parsed."
+            elif [ "$UNKNOWN_COUNT" -gt 0 ]; then
+              echo "FAILED: Unknown severity findings detected."
+            elif [ "$HIGH_COUNT" -gt 0 ]; then
+              echo "FAILED: High-severity findings detected."
+            else
+              echo "PASSED: No High-severity findings detected."
+            fi
+
+            {
+              echo "export PMD_SCAN_STATUS='${SCAN_STATUS}'"
+              echo "export PMD_PARSE_STATUS='${PARSE_STATUS}'"
+              echo "export PMD_HIGH_COUNT='${HIGH_COUNT}'"
+              echo "export PMD_MEDIUM_COUNT='${MEDIUM_COUNT}'"
+              echo "export PMD_LOW_COUNT='${LOW_COUNT}'"
+              echo "export PMD_UNKNOWN_COUNT='${UNKNOWN_COUNT}'"
+            } >> "$BASH_ENV"
+
+            if [ "$SCAN_STATUS" -ne 0 ] || [ "$PARSE_STATUS" -ne 0 ] || [ "$UNKNOWN_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
+              exit 1
+            fi
+
+            exit 0
+
+      # -----------------------------------------------
+      #  5. Publish PMD reports as CircleCI artifacts
+      # Keep after the PMD step; configure an always-run
+      # artifact upload approach if PMD failures must also upload reports.
+      # -----------------------------------------------
       - store_artifacts:
           path: pmd-output
-          destination: PMDReports
-          when: always
+          destination: salesforce-pmd-report
 
+      # -----------------------------------------------
+      # 6. AUTHENTICATE TO THE TARGET ORG
+      # -----------------------------------------------
       - run:
-          name: Enforce PMD Scan Result
+          name: Authenticate Salesforce with JWT
           command: |
             set -euo pipefail
-            source "$BASH_ENV"
-            if [ "${PMD_SCAN_STATUS:-1}" -ne 0 ]; then echo "PMD scan failed or exceeded its configured severity threshold."; exit 1; fi
-            echo "PMD scan passed."
-
-      - run:
-          name: Create JWT Key and Authenticate Salesforce
-          command: |
-            set -euo pipefail
-            source "$BASH_ENV"
 
             case "$TARGET_ENVIRONMENT" in
-              qa) CLIENT_ID="${SF_QA_CLIENT_ID:?Missing SF_QA_CLIENT_ID}"; USERNAME="${SF_QA_USERNAME:?Missing SF_QA_USERNAME}"; INSTANCE_URL="${SF_QA_INSTANCE_URL:?Missing SF_QA_INSTANCE_URL}"; KEY_B64="${JWT_KEY_QA:?Missing JWT_KEY_QA}" ;;
-              uat) CLIENT_ID="${SF_UAT_CLIENT_ID:?Missing SF_UAT_CLIENT_ID}"; USERNAME="${SF_UAT_USERNAME:?Missing SF_UAT_USERNAME}"; INSTANCE_URL="${SF_UAT_INSTANCE_URL:?Missing SF_UAT_INSTANCE_URL}"; KEY_B64="${JWT_KEY_UAT:?Missing JWT_KEY_UAT}" ;;
-              prod) CLIENT_ID="${SF_PROD_CLIENT_ID:?Missing SF_PROD_CLIENT_ID}"; USERNAME="${SF_PROD_USERNAME:?Missing SF_PROD_USERNAME}"; INSTANCE_URL="${SF_PROD_INSTANCE_URL:?Missing SF_PROD_INSTANCE_URL}"; KEY_B64="${JWT_KEY_PROD:?Missing JWT_KEY_PROD}" ;;
-              *) echo "Unknown environment: $TARGET_ENVIRONMENT"; exit 1 ;;
+              qa)
+                USERNAME_ENV="SF_QA_USERNAME"
+                CLIENT_ID_ENV="SF_QA_CLIENT_ID"
+                INSTANCE_URL_ENV="SF_QA_INSTANCE_URL"
+                JWT_ENV="JWT_KEY_QA"
+                ;;
+              uat)
+                USERNAME_ENV="SF_UAT_USERNAME"
+                CLIENT_ID_ENV="SF_UAT_CLIENT_ID"
+                INSTANCE_URL_ENV="SF_UAT_INSTANCE_URL"
+                JWT_ENV="JWT_KEY_UAT"
+                ;;
+              prod)
+                USERNAME_ENV="SF_PROD_USERNAME"
+                CLIENT_ID_ENV="SF_PROD_CLIENT_ID"
+                INSTANCE_URL_ENV="SF_PROD_INSTANCE_URL"
+                JWT_ENV="JWT_KEY_PROD"
+                ;;
+              *)
+                echo "ERROR: Unsupported target environment."
+                exit 1
+                ;;
             esac
 
-            printf '%s' "$KEY_B64" | base64 --decode > circleci.key
-            chmod 600 circleci.key
-            sf org login jwt --client-id "$CLIENT_ID" --jwt-key-file circleci.key --username "$USERNAME" --instance-url "$INSTANCE_URL" --alias targetorg
-            sf org display --target-org targetorg
+            USERNAME="${!USERNAME_ENV:-}"
+            CLIENT_ID="${!CLIENT_ID_ENV:-}"
+            INSTANCE_URL="${!INSTANCE_URL_ENV:-}"
+            JWT_B64="${!JWT_ENV:-}"
 
+            if [ -z "$USERNAME" ] ||
+               [ -z "$CLIENT_ID" ] ||
+               [ -z "$INSTANCE_URL" ] ||
+               [ -z "$JWT_B64" ]; then
+              echo "ERROR: One or more Salesforce environment variables are missing."
+              exit 1
+            fi
+
+            KEY_FILE="$PWD/circleci.key"
+
+            printf '%s' "$JWT_B64" | base64 --decode > "$KEY_FILE"
+            chmod 600 "$KEY_FILE"
+
+            sf org login jwt \
+              --client-id "$CLIENT_ID" \
+              --jwt-key-file "$KEY_FILE" \
+              --username "$USERNAME" \
+              --instance-url "$INSTANCE_URL" \
+              --alias targetorg
+
+            rm -f "$KEY_FILE"
+
+      # -----------------------------------------------
+      # 7. VALIDATE OR DEPLOY
+      # -----------------------------------------------
       - run:
-          name: Validate PR or Deploy Changes
+          name: Salesforce Dry Run Validation or Deployment
           command: |
             set -euo pipefail
-            source "$BASH_ENV"
 
-            if [ "$HAS_DELTA" != "true" ] && [ "$HAS_DESTRUCTIVE" != "true" ] && [ "$HAS_CHANGED_FILES" != "true" ]; then
-              echo "No Salesforce changes detected."
+            if [ "$HAS_CHANGES" != "true" ]; then
+              echo "No deployable metadata changes detected."
               exit 0
             fi
 
-            TEST_LEVEL="<< parameters.test_level >>"
-            if [ "$TARGET_ENVIRONMENT" != "prod" ] && [ "$HAS_DELTA" = "true" ] && grep -E -q '<name>(ApexClass|ApexTrigger)</name>' delta/package/package.xml; then
-              TEST_LEVEL="RunLocalTests"
+            PKG_FILE="delta/package/package.xml"
+
+            PRE_XML=""
+            POST_XML=""
+
+            # Support common destructive manifest naming conventions.
+            for FILE in \
+              delta/destructiveChanges/preDestructiveChanges.xml \
+              delta/destructiveChanges/destructiveChangesPre.xml
+            do
+              if [ -f "$FILE" ]; then
+                PRE_XML="$FILE"
+                break
+              fi
+            done
+
+            for FILE in \
+              delta/destructiveChanges/postDestructiveChanges.xml \
+              delta/destructiveChanges/destructiveChangesPost.xml \
+              delta/destructiveChanges/destructiveChanges.xml
+            do
+              if [ -f "$FILE" ]; then
+                POST_XML="$FILE"
+                break
+              fi
+            done
+
+            # Use the generated manifest when available.
+            if [ -f "$PKG_FILE" ] &&
+               grep -q "<members>" "$PKG_FILE"; then
+
+              DEPLOY_ARGS=(--manifest "$PKG_FILE")
+
+            elif [ -d "delta/force-app/main/default" ]; then
+
+              echo "Using the generated delta source directory."
+              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
+
+            else
+              echo "ERROR: Changes were detected, but no deployable delta was generated."
+              echo "Refusing to deploy the entire force-app directory as a fallback."
+              exit 1
             fi
 
-            ARGS=(--target-org targetorg --wait 1000 --verbose --ignore-conflicts)
-            if [ "$HAS_DELTA" = "true" ]; then ARGS+=(--manifest delta/package/package.xml); else ARGS+=(--source-dir force-app); fi
-            ARGS+=(--test-level "$TEST_LEVEL")
-            if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then ARGS+=(--tests EpicAccountContactRelationBatchTest --tests EpicActivityUpdateBatchTest); fi
-            if [ -f delta/destructiveChanges/preDestructiveChanges.xml ]; then ARGS+=(--pre-destructive-changes delta/destructiveChanges/preDestructiveChanges.xml); fi
-            if [ -f delta/destructiveChanges/postDestructiveChanges.xml ]; then ARGS+=(--post-destructive-changes delta/destructiveChanges/postDestructiveChanges.xml); fi
+            # Destructive changes require a deployment manifest.
+            if [ -n "$PRE_XML" ] || [ -n "$POST_XML" ]; then
+              if [ ! -f "$PKG_FILE" ]; then
+                echo "ERROR: Destructive changes require a package manifest."
+                exit 1
+              fi
+
+              DEPLOY_ARGS=(--manifest "$PKG_FILE")
+            fi
+
+            if [ -n "$PRE_XML" ]; then
+              DEPLOY_ARGS+=(--pre-destructive-changes "$PRE_XML")
+            fi
+
+            if [ -n "$POST_XML" ]; then
+              DEPLOY_ARGS+=(--post-destructive-changes "$POST_XML")
+            fi
+
+            echo "Environment: ${TARGET_ENVIRONMENT}"
+            echo "Mode: ${PIPELINE_MODE}"
+            echo "Test level: RunLocalTests"
+
+            COMMON_ARGS=(
+              --target-org targetorg
+              --test-level RunLocalTests
+              --wait 800
+              --ignore-warnings
+              --verbose
+            )
 
             if [ "$PIPELINE_MODE" = "validate" ]; then
-              echo "Running Salesforce dry-run validation against $TARGET_ENVIRONMENT."
-              sf project deploy start "${ARGS[@]}" --dry-run
+              echo "Starting Salesforce dry-run validation..."
+
+              sf project deploy start \
+                "${DEPLOY_ARGS[@]}" \
+                "${COMMON_ARGS[@]}" \
+                --dry-run
             else
-              echo "Deploying changes to $TARGET_ENVIRONMENT."
-              sf project deploy start "${ARGS[@]}"
+              echo "Starting Salesforce deployment..."
+
+              sf project deploy start \
+                "${DEPLOY_ARGS[@]}" \
+                "${COMMON_ARGS[@]}"
             fi
 
+      # -----------------------------------------------
+      # 8. SAVE REPORTS AND DELTA ARTIFACTS
+      # -----------------------------------------------
+      - when:
+          condition:
+            equal: ["always", "always"]
+          steps:
+            - store_artifacts:
+                path: pmd-output
+                destination: salesforce-pmd-report
+
+            - store_artifacts:
+                path: delta
+                destination: salesforce-delta
+
+      # -----------------------------------------------
+      # 9. CLEAN UP JWT KEY
+      # -----------------------------------------------
       - run:
-          name: Remove JWT Key
+          name: Cleanup JWT Key
           when: always
-          command: rm -f circleci.key
-
-      - store_artifacts:
-          path: reports
-          destination: SalesforceReports
-          when: always
-
-      - store_artifacts:
-          path: delta
-          destination: SalesforceDelta
-          when: always
+          command: |
+            rm -f circleci.key
 
 workflows:
+  version: 2
+
+  # -----------------------------------------------
+  # PR VALIDATION
+  # -----------------------------------------------
   pull_request_validation:
     jobs:
       - deploy:
-          name: validate-pr
-          mode: validate
+          name: validate-pull-request
+          username: SF_QA_USERNAME
+          client_id: SF_QA_CLIENT_ID
+          instance_url: SF_QA_INSTANCE_URL
+          jwt_key: JWT_KEY_QA
           environment: auto
-          test_level: NoTestRun
+          mode: validate
           filters:
             branches:
-              only:
-                - /feature\/.*/
-                - /release\/.*/
-                - /sprint\/.*/
-                - /HotFix\/.*/
+              only: /^(feature|release|sprint|HotFix)\/.+$/
 
+  # -----------------------------------------------
+  # QA DEPLOYMENT
+  # -----------------------------------------------
   deploy_qa:
     jobs:
       - deploy:
           name: deploy-qa
-          mode: deploy
+          username: SF_QA_USERNAME
+          client_id: SF_QA_CLIENT_ID
+          instance_url: SF_QA_INSTANCE_URL
+          jwt_key: JWT_KEY_QA
           environment: qa
-          test_level: NoTestRun
+          mode: deploy
           filters:
             branches:
               only: qa
 
+  # -----------------------------------------------
+  # UAT DEPLOYMENT
+  # -----------------------------------------------
   deploy_uat:
     jobs:
       - deploy:
           name: deploy-uat
-          mode: deploy
+          username: SF_UAT_USERNAME
+          client_id: SF_UAT_CLIENT_ID
+          instance_url: SF_UAT_INSTANCE_URL
+          jwt_key: JWT_KEY_UAT
           environment: uat
-          test_level: RunLocalTests
+          mode: deploy
           filters:
             branches:
               only: uat
 
+  # -----------------------------------------------
+  # PRODUCTION VALIDATION, APPROVAL AND DEPLOYMENT
+  # -----------------------------------------------
   deploy_production:
     jobs:
       - deploy:
           name: validate-production
-          mode: validate
+          username: SF_PROD_USERNAME
+          client_id: SF_PROD_CLIENT_ID
+          instance_url: SF_PROD_INSTANCE_URL
+          jwt_key: JWT_KEY_PROD
           environment: prod
-          test_level: RunSpecifiedTests
+          mode: validate
           filters:
             branches:
               only: main
@@ -279,9 +721,12 @@ workflows:
 
       - deploy:
           name: deploy-prod
-          mode: deploy
+          username: SF_PROD_USERNAME
+          client_id: SF_PROD_CLIENT_ID
+          instance_url: SF_PROD_INSTANCE_URL
+          jwt_key: JWT_KEY_PROD
           environment: prod
-          test_level: RunSpecifiedTests
+          mode: deploy
           requires:
             - approve-prod
           filters:
