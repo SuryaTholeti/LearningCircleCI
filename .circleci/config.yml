@@ -518,12 +518,17 @@ jobs:
             rm -f "$KEY_FILE"
 
       # -----------------------------------------------
-      # 7. VALIDATE OR DEPLOY
+      # 7. SALESFORCE DRY-RUN VALIDATION
       # -----------------------------------------------
       - run:
-          name: Salesforce Dry Run Validation or Deployment
+          name: Salesforce Dry-Run Validation
           command: |
             set -euo pipefail
+
+            if [ "$PIPELINE_MODE" != "validate" ]; then
+              echo "Skipping validation. Mode: $PIPELINE_MODE"
+              exit 0
+            fi
 
             if [ "$HAS_CHANGES" != "true" ]; then
               echo "No deployable metadata changes detected."
@@ -531,56 +536,42 @@ jobs:
             fi
 
             PKG_FILE="delta/package/package.xml"
-
             PRE_XML=""
             POST_XML=""
 
-            # Support common destructive manifest naming conventions.
-            for FILE in \
-              delta/destructiveChanges/preDestructiveChanges.xml \
-              delta/destructiveChanges/destructiveChangesPre.xml
-            do
+            # Detect pre-destructive changes
+            for FILE in delta/destructiveChanges/preDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPre.xml; do
               if [ -f "$FILE" ]; then
                 PRE_XML="$FILE"
                 break
               fi
             done
 
-            for FILE in \
-              delta/destructiveChanges/postDestructiveChanges.xml \
-              delta/destructiveChanges/destructiveChangesPost.xml \
-              delta/destructiveChanges/destructiveChanges.xml
-            do
+            # Detect post-destructive changes
+            for FILE in delta/destructiveChanges/postDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPost.xml delta/destructiveChanges/destructiveChanges.xml; do
               if [ -f "$FILE" ]; then
                 POST_XML="$FILE"
                 break
               fi
             done
 
-            # Use the generated manifest when available.
-            if [ -f "$PKG_FILE" ] &&
-               grep -q "<members>" "$PKG_FILE"; then
-
+            # Prepare deployment arguments
+            if [ -f "$PKG_FILE" ] && grep -q "<members>" "$PKG_FILE"; then
               DEPLOY_ARGS=(--manifest "$PKG_FILE")
-
             elif [ -d "delta/force-app/main/default" ]; then
-
-              echo "Using the generated delta source directory."
+              echo "Using generated delta source directory."
               DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
-
             else
-              echo "ERROR: Changes were detected, but no deployable delta was generated."
-              echo "Refusing to deploy the entire force-app directory as a fallback."
+              echo "ERROR: No deployable delta generated."
               exit 1
             fi
 
-            # Destructive changes require a deployment manifest.
+            # Destructive changes require package.xml
             if [ -n "$PRE_XML" ] || [ -n "$POST_XML" ]; then
               if [ ! -f "$PKG_FILE" ]; then
-                echo "ERROR: Destructive changes require a package manifest."
+                echo "ERROR: Destructive changes require package.xml."
                 exit 1
               fi
-
               DEPLOY_ARGS=(--manifest "$PKG_FILE")
             fi
 
@@ -592,48 +583,107 @@ jobs:
               DEPLOY_ARGS+=(--post-destructive-changes "$POST_XML")
             fi
 
-            echo "Environment: ${TARGET_ENVIRONMENT}"
-            echo "Mode: ${PIPELINE_MODE}"
-            echo "Test level: RunLocalTests"
+            echo "============================================"
+            echo "SALESFORCE DRY-RUN VALIDATION"
+            echo "============================================"
+            echo "Environment : $TARGET_ENVIRONMENT"
+            echo "Mode        : $PIPELINE_MODE"
+            echo "Test level  : RunLocalTests"
 
-            COMMON_ARGS=(
-              --target-org targetorg
-              --test-level RunLocalTests
-              --wait 800
-              --ignore-warnings
+            sf project deploy start \
+              "${DEPLOY_ARGS[@]}" \
+              --target-org targetorg \
+              --test-level RunLocalTests \
+              --dry-run \
+              --wait 800 \
+              --ignore-warnings \
               --verbose
-            )
 
-            if [ "$PIPELINE_MODE" = "validate" ]; then
-              echo "Starting Salesforce dry-run validation..."
+            echo "Salesforce dry-run validation completed successfully."
 
-              sf project deploy start \
-                "${DEPLOY_ARGS[@]}" \
-                "${COMMON_ARGS[@]}" \
-                --dry-run
-            else
-              echo "Starting Salesforce deployment..."
+      # -----------------------------------------------
+      # 8. SALESFORCE ACTUAL DEPLOYMENT
+      # -----------------------------------------------
+      - run:
+          name: Salesforce Actual Deployment
+          command: |
+            set -euo pipefail
 
-              sf project deploy start \
-                "${DEPLOY_ARGS[@]}" \
-                "${COMMON_ARGS[@]}"
+            if [ "$PIPELINE_MODE" != "deploy" ]; then
+              echo "Skipping deployment. Mode: $PIPELINE_MODE"
+              exit 0
             fi
 
-      # -----------------------------------------------
-      # 8. SAVE REPORTS AND DELTA ARTIFACTS
-      # -----------------------------------------------
-      - when:
-          condition:
-            equal: ["always", "always"]
-          steps:
-            - store_artifacts:
-                path: pmd-output
-                destination: salesforce-pmd-report
+            if [ "$HAS_CHANGES" != "true" ]; then
+              echo "No deployable metadata changes detected."
+              exit 0
+            fi
 
-            - store_artifacts:
-                path: delta
-                destination: salesforce-delta
+            PKG_FILE="delta/package/package.xml"
+            PRE_XML=""
+            POST_XML=""
 
+            # Detect pre-destructive changes
+            for FILE in delta/destructiveChanges/preDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPre.xml; do
+              if [ -f "$FILE" ]; then
+                PRE_XML="$FILE"
+                break
+              fi
+            done
+
+            # Detect post-destructive changes
+            for FILE in delta/destructiveChanges/postDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPost.xml delta/destructiveChanges/destructiveChanges.xml; do
+              if [ -f "$FILE" ]; then
+                POST_XML="$FILE"
+                break
+              fi
+            done
+
+            # Prepare deployment arguments
+            if [ -f "$PKG_FILE" ] && grep -q "<members>" "$PKG_FILE"; then
+              DEPLOY_ARGS=(--manifest "$PKG_FILE")
+            elif [ -d "delta/force-app/main/default" ]; then
+              echo "Using generated delta source directory."
+              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
+            else
+              echo "ERROR: No deployable delta generated."
+              exit 1
+            fi
+
+            # Destructive changes require package.xml
+            if [ -n "$PRE_XML" ] || [ -n "$POST_XML" ]; then
+              if [ ! -f "$PKG_FILE" ]; then
+                echo "ERROR: Destructive changes require package.xml."
+                exit 1
+              fi
+              DEPLOY_ARGS=(--manifest "$PKG_FILE")
+            fi
+
+            if [ -n "$PRE_XML" ]; then
+              DEPLOY_ARGS+=(--pre-destructive-changes "$PRE_XML")
+            fi
+
+            if [ -n "$POST_XML" ]; then
+              DEPLOY_ARGS+=(--post-destructive-changes "$POST_XML")
+            fi
+
+            echo "============================================"
+            echo "SALESFORCE ACTUAL DEPLOYMENT"
+            echo "============================================"
+            echo "Environment : $TARGET_ENVIRONMENT"
+            echo "Mode        : $PIPELINE_MODE"
+            echo "Test level  : RunLocalTests"
+
+            sf project deploy start \
+              "${DEPLOY_ARGS[@]}" \
+              --target-org targetorg \
+              --test-level RunLocalTests \
+              --wait 800 \
+              --ignore-warnings \
+              --verbose
+
+            echo "Salesforce deployment completed successfully."   
+            
       # -----------------------------------------------
       # 9. CLEAN UP JWT KEY
       # -----------------------------------------------
@@ -736,5 +786,6 @@ workflows:
           filters:
             branches:
               only: main
-              
+
+
               
