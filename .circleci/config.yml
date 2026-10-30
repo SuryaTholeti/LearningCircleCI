@@ -530,65 +530,117 @@ jobs:
               exit 0
             fi
 
-            if [ "$HAS_CHANGES" != "true" ]; then
-              echo "No deployable metadata changes detected."
-              exit 0
-            fi
-
             PKG_FILE="delta/package/package.xml"
             PRE_XML=""
             POST_XML=""
+            DEPLOY_ARGS=()
 
+            echo "============================================"
+            echo "SALESFORCE DRY-RUN VALIDATION"
+            echo "============================================"
+
+            echo "Environment : $TARGET_ENVIRONMENT"
+            echo "Mode        : $PIPELINE_MODE"
+            echo "Test level  : RunLocalTests"
+
+            # ---------------------------------------
             # Detect pre-destructive changes
-            for FILE in delta/destructiveChanges/preDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPre.xml; do
-              if [ -f "$FILE" ]; then
+            # ---------------------------------------
+            for FILE in \
+              delta/destructiveChanges/preDestructiveChanges.xml \
+              delta/destructiveChanges/destructiveChangesPre.xml
+            do
+              if [ -s "$FILE" ]; then
                 PRE_XML="$FILE"
                 break
               fi
             done
 
+            # ---------------------------------------
             # Detect post-destructive changes
-            for FILE in delta/destructiveChanges/postDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPost.xml delta/destructiveChanges/destructiveChanges.xml; do
-              if [ -f "$FILE" ]; then
+            # ---------------------------------------
+            for FILE in \
+              delta/destructiveChanges/postDestructiveChanges.xml \
+              delta/destructiveChanges/destructiveChangesPost.xml \
+              delta/destructiveChanges/destructiveChanges.xml
+            do
+              if [ -s "$FILE" ]; then
                 POST_XML="$FILE"
                 break
               fi
             done
 
-            # Prepare deployment arguments
-            if [ -f "$PKG_FILE" ] && grep -q "<members>" "$PKG_FILE"; then
-              DEPLOY_ARGS=(--manifest "$PKG_FILE")
-            elif [ -d "delta/force-app/main/default" ]; then
-              echo "Using generated delta source directory."
-              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
-            else
-              echo "ERROR: No deployable delta generated."
-              exit 1
+            # ---------------------------------------
+            # Check whether destructive changes exist
+            # ---------------------------------------
+            HAS_PRE_DESTRUCTIVE="false"
+            HAS_POST_DESTRUCTIVE="false"
+
+            if [ -n "$PRE_XML" ]; then
+              HAS_PRE_DESTRUCTIVE="true"
             fi
 
-            # Destructive changes require package.xml
-            if [ -n "$PRE_XML" ] || [ -n "$POST_XML" ]; then
-              if [ ! -f "$PKG_FILE" ]; then
-                echo "ERROR: Destructive changes require package.xml."
+            if [ -n "$POST_XML" ]; then
+              HAS_POST_DESTRUCTIVE="true"
+            fi
+
+            # ---------------------------------------
+            # Prepare deployment arguments
+            # ---------------------------------------
+
+            if [ "$HAS_PRE_DESTRUCTIVE" = "true" ] || \
+               [ "$HAS_POST_DESTRUCTIVE" = "true" ]; then
+
+              echo "Destructive changes detected."
+
+              if [ ! -s "$PKG_FILE" ]; then
+                echo "ERROR: Destructive changes require a valid package.xml."
                 exit 1
               fi
+
               DEPLOY_ARGS=(--manifest "$PKG_FILE")
+
+            elif [ -f "$PKG_FILE" ] && \
+                 grep -Eq '<members>[^<]+</members>' "$PKG_FILE"; then
+
+              echo "Using generated delta package.xml."
+
+              DEPLOY_ARGS=(--manifest "$PKG_FILE")
+
+            elif [ -d "delta/force-app/main/default" ] && \
+                 find delta/force-app/main/default -type f -print -quit | grep -q .; then
+
+              echo "Using generated delta source directory."
+
+              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
+
+            else
+
+              echo "No deployable Salesforce metadata changes found."
+              echo "Skipping dry-run validation successfully."
+              exit 0
+
             fi
+
+            # ---------------------------------------
+            # Add destructive change arguments
+            # ---------------------------------------
 
             if [ -n "$PRE_XML" ]; then
               DEPLOY_ARGS+=(--pre-destructive-changes "$PRE_XML")
+              echo "Pre-destructive changes: $PRE_XML"
             fi
 
             if [ -n "$POST_XML" ]; then
               DEPLOY_ARGS+=(--post-destructive-changes "$POST_XML")
+              echo "Post-destructive changes: $POST_XML"
             fi
 
-            echo "============================================"
-            echo "SALESFORCE DRY-RUN VALIDATION"
-            echo "============================================"
-            echo "Environment : $TARGET_ENVIRONMENT"
-            echo "Mode        : $PIPELINE_MODE"
-            echo "Test level  : RunLocalTests"
+            # ---------------------------------------
+            # Execute Salesforce dry-run validation
+            # ---------------------------------------
+
+            echo "Starting Salesforce dry-run validation..."
 
             sf project deploy start \
               "${DEPLOY_ARGS[@]}" \
@@ -599,7 +651,9 @@ jobs:
               --ignore-warnings \
               --verbose
 
-            echo "Salesforce dry-run validation completed successfully."
+            echo "============================================"
+            echo "SUCCESS: Salesforce dry-run validation completed."
+            echo "============================================"
 
       # -----------------------------------------------
       # 8. SALESFORCE ACTUAL DEPLOYMENT
@@ -614,65 +668,117 @@ jobs:
               exit 0
             fi
 
-            if [ "$HAS_CHANGES" != "true" ]; then
-              echo "No deployable metadata changes detected."
-              exit 0
-            fi
-
             PKG_FILE="delta/package/package.xml"
             PRE_XML=""
             POST_XML=""
+            DEPLOY_ARGS=()
 
+            echo "============================================"
+            echo "SALESFORCE ACTUAL DEPLOYMENT"
+            echo "============================================"
+
+            echo "Environment : $TARGET_ENVIRONMENT"
+            echo "Mode        : $PIPELINE_MODE"
+            echo "Test level  : RunLocalTests"
+
+            # ---------------------------------------
             # Detect pre-destructive changes
-            for FILE in delta/destructiveChanges/preDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPre.xml; do
-              if [ -f "$FILE" ]; then
+            # ---------------------------------------
+            for FILE in \
+              delta/destructiveChanges/preDestructiveChanges.xml \
+              delta/destructiveChanges/destructiveChangesPre.xml
+            do
+              if [ -s "$FILE" ]; then
                 PRE_XML="$FILE"
                 break
               fi
             done
 
+            # ---------------------------------------
             # Detect post-destructive changes
-            for FILE in delta/destructiveChanges/postDestructiveChanges.xml delta/destructiveChanges/destructiveChangesPost.xml delta/destructiveChanges/destructiveChanges.xml; do
-              if [ -f "$FILE" ]; then
+            # ---------------------------------------
+            for FILE in \
+              delta/destructiveChanges/postDestructiveChanges.xml \
+              delta/destructiveChanges/destructiveChangesPost.xml \
+              delta/destructiveChanges/destructiveChanges.xml
+            do
+              if [ -s "$FILE" ]; then
                 POST_XML="$FILE"
                 break
               fi
             done
 
-            # Prepare deployment arguments
-            if [ -f "$PKG_FILE" ] && grep -q "<members>" "$PKG_FILE"; then
-              DEPLOY_ARGS=(--manifest "$PKG_FILE")
-            elif [ -d "delta/force-app/main/default" ]; then
-              echo "Using generated delta source directory."
-              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
-            else
-              echo "ERROR: No deployable delta generated."
-              exit 1
+            # ---------------------------------------
+            # Check whether destructive changes exist
+            # ---------------------------------------
+            HAS_PRE_DESTRUCTIVE="false"
+            HAS_POST_DESTRUCTIVE="false"
+
+            if [ -n "$PRE_XML" ]; then
+              HAS_PRE_DESTRUCTIVE="true"
             fi
 
-            # Destructive changes require package.xml
-            if [ -n "$PRE_XML" ] || [ -n "$POST_XML" ]; then
-              if [ ! -f "$PKG_FILE" ]; then
-                echo "ERROR: Destructive changes require package.xml."
+            if [ -n "$POST_XML" ]; then
+              HAS_POST_DESTRUCTIVE="true"
+            fi
+
+            # ---------------------------------------
+            # Prepare deployment arguments
+            # ---------------------------------------
+
+            if [ "$HAS_PRE_DESTRUCTIVE" = "true" ] || \
+               [ "$HAS_POST_DESTRUCTIVE" = "true" ]; then
+
+              echo "Destructive changes detected."
+
+              if [ ! -s "$PKG_FILE" ]; then
+                echo "ERROR: Destructive changes require a valid package.xml."
                 exit 1
               fi
+
               DEPLOY_ARGS=(--manifest "$PKG_FILE")
+
+            elif [ -f "$PKG_FILE" ] && \
+                 grep -Eq '<members>[^<]+</members>' "$PKG_FILE"; then
+
+              echo "Using generated delta package.xml."
+
+              DEPLOY_ARGS=(--manifest "$PKG_FILE")
+
+            elif [ -d "delta/force-app/main/default" ] && \
+                 find delta/force-app/main/default -type f -print -quit | grep -q .; then
+
+              echo "Using generated delta source directory."
+
+              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
+
+            else
+
+              echo "No deployable Salesforce metadata changes found."
+              echo "Skipping actual deployment successfully."
+              exit 0
+
             fi
+
+            # ---------------------------------------
+            # Add destructive change arguments
+            # ---------------------------------------
 
             if [ -n "$PRE_XML" ]; then
               DEPLOY_ARGS+=(--pre-destructive-changes "$PRE_XML")
+              echo "Pre-destructive changes: $PRE_XML"
             fi
 
             if [ -n "$POST_XML" ]; then
               DEPLOY_ARGS+=(--post-destructive-changes "$POST_XML")
+              echo "Post-destructive changes: $POST_XML"
             fi
 
-            echo "============================================"
-            echo "SALESFORCE ACTUAL DEPLOYMENT"
-            echo "============================================"
-            echo "Environment : $TARGET_ENVIRONMENT"
-            echo "Mode        : $PIPELINE_MODE"
-            echo "Test level  : RunLocalTests"
+            # ---------------------------------------
+            # Execute actual Salesforce deployment
+            # ---------------------------------------
+
+            echo "Starting Salesforce actual deployment..."
 
             sf project deploy start \
               "${DEPLOY_ARGS[@]}" \
@@ -682,8 +788,10 @@ jobs:
               --ignore-warnings \
               --verbose
 
-            echo "Salesforce deployment completed successfully."   
-            
+            echo "============================================"
+            echo "SUCCESS: Salesforce deployment completed."
+            echo "============================================"
+
       # -----------------------------------------------
       # 9. CLEAN UP JWT KEY
       # -----------------------------------------------
@@ -777,7 +885,7 @@ workflows:
           name: deploy-prod
           username: SF_PROD_USERNAME
           client_id: SF_PROD_CLIENT_ID
-          instance_url: SF_PROD_INSTANCE_URL
+          instance_url: SF_PROD_INSTANCE_URL 
           jwt_key: JWT_KEY_PROD
           environment: prod
           mode: deploy
