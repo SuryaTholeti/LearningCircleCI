@@ -32,7 +32,7 @@ public inherited sharing class AccountService {
       acc.Description = newDescription;
     }
 
-    // Fix 2: Added 'AS USER' to enforce user mode on DML operations
+    // Fix 2: Added 'AS USER' to enforce user mode on DML operations all checks will done
     update as user accountsToUpdate;
   }
 }
