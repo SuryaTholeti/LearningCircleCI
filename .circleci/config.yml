@@ -41,8 +41,8 @@ jobs:
 
       # -----------------------------------------------
       # 1. INSTALL SALESFORCE CLI AND REQUIRED TOOLS
-      # -----------------------------------------------
-
+      # -----------------------------------------------      
+      
       - run:
           name: Install Salesforce CLI and Tools
           command: |
@@ -78,6 +78,8 @@ jobs:
             sf plugins
             java -version
             sf code-analyzer --help
+
+
 
       # -----------------------------------------------
       # 2. RESOLVE TARGET ENVIRONMENT
@@ -971,7 +973,9 @@ jobs:
           command: |
             rm -f circleci.key
 
+
 workflows:
+
   # 1. Pull Request Validation
   pr-validation:
     jobs:
@@ -1099,3 +1103,5 @@ workflows:
           filters:
             branches:
               only: main
+
+              
