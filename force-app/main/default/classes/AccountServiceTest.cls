@@ -49,7 +49,7 @@ private class AccountServiceTest {
     AccountService.updateAccountDescriptions(new List<Id>(), 'New Desc');
     Test.stopTest();
 
-    // If no exception is thrown and code completes, the negative path is successful
+    // If no exception is thrown and code completes, the negative path is successful lets rock
     Assert.isTrue(
       true,
       'Empty list handled gracefully without throwing errors.'
