@@ -17,6 +17,12 @@ jobs:
       mode:
         type: enum
         enum: ["validate", "deploy"]
+      persist_validated_artifact:
+        type: boolean
+        default: false
+      use_validated_artifact:
+        type: boolean
+        default: false
 
     docker:
       - image: cimg/node:22.17
@@ -26,10 +32,17 @@ jobs:
     steps:
       - checkout
 
+      - when:
+          condition:
+            equal: [true, << parameters.use_validated_artifact >>]
+          steps:
+            - attach_workspace:
+                at: ~/project
+
       # -----------------------------------------------
       # 1. INSTALL SALESFORCE CLI AND REQUIRED TOOLS
-      # -----------------------------------------------      
-      
+      # -----------------------------------------------
+
       - run:
           name: Install Salesforce CLI and Tools
           command: |
@@ -65,8 +78,6 @@ jobs:
             sf plugins
             java -version
             sf code-analyzer --help
-
-
 
       # -----------------------------------------------
       # 2. RESOLVE TARGET ENVIRONMENT
@@ -111,7 +122,8 @@ jobs:
                   ;;
                 *)
                   echo "PR targets '${BASE_BRANCH}'."
-                  echo "This pipeline validates only PRs targeting qa, uat, or main."
+                  echo "Skipping validation for unsupported target branch."
+                  circleci-agent step halt
                   exit 0
                   ;;
               esac
@@ -154,7 +166,63 @@ jobs:
           command: |
             set -euo pipefail
 
+            USE_VALIDATED_ARTIFACT="<< parameters.use_validated_artifact >>"
             mkdir -p delta
+
+            # Deployment jobs reuse the exact delta package produced by validation.
+            if [ "$USE_VALIDATED_ARTIFACT" = "true" ]; then
+              if [ ! -s .circleci-validated-commit ]; then
+                echo "ERROR: Validated commit marker is missing from workspace."
+                exit 1
+              fi
+
+              VALIDATED_SHA=$(cat .circleci-validated-commit)
+              CURRENT_SHA=$(git rev-parse HEAD)
+
+              echo "Validated commit: $VALIDATED_SHA"
+              echo "Deployment checkout: $CURRENT_SHA"
+
+              if [ "$VALIDATED_SHA" != "$CURRENT_SHA" ]; then
+                echo "ERROR: Deployment checkout differs from the validated commit."
+                exit 1
+              fi
+
+              if [ ! -d delta ]; then
+                echo "ERROR: Validated delta directory is missing."
+                exit 1
+              fi
+
+              HAS_DELTA="false"
+              HAS_CHANGES="false"
+
+              if [ -f delta/package/package.xml ] && \
+                 grep -q "<members>" delta/package/package.xml; then
+                HAS_DELTA="true"
+                HAS_CHANGES="true"
+              fi
+
+              for FILE in \
+                delta/destructiveChanges/destructiveChanges.xml \
+                delta/destructiveChanges/destructiveChangesPre.xml \
+                delta/destructiveChanges/destructiveChangesPost.xml \
+                delta/destructiveChanges/preDestructiveChanges.xml \
+                delta/destructiveChanges/postDestructiveChanges.xml
+              do
+                if [ -s "$FILE" ]; then
+                  HAS_CHANGES="true"
+                fi
+              done
+
+              {
+                echo "export HAS_DELTA='${HAS_DELTA}'"
+                echo "export HAS_CHANGES='${HAS_CHANGES}'"
+              } >> "$BASH_ENV"
+
+              echo "Reusing validated delta for commit $VALIDATED_SHA"
+              echo "HAS_DELTA=${HAS_DELTA}"
+              echo "HAS_CHANGES=${HAS_CHANGES}"
+              exit 0
+            fi
 
             git fetch origin --prune
 
@@ -164,20 +232,16 @@ jobs:
 
             if [ "$IS_PR" = "true" ]; then
               git fetch origin "$BASE_BRANCH"
-
               FROM_COMMIT=$(git merge-base HEAD "origin/${BASE_BRANCH}")
             else
               if ! git rev-parse HEAD^ >/dev/null 2>&1; then
-                echo "No previous commit exists. No delta can be generated."
-                echo "export HAS_DELTA=false" >> "$BASH_ENV"
-                echo "export HAS_CHANGES=false" >> "$BASH_ENV"
-                exit 0
+                echo "ERROR: Previous commit not found; cannot safely generate a delta."
+                exit 1
               fi
-
-              FROM_COMMIT="HEAD^"
+              FROM_COMMIT=$(git rev-parse HEAD^)
             fi
 
-            echo "Comparing ${FROM_COMMIT} with HEAD"
+            echo "Comparing ${FROM_COMMIT} with HEAD ($(git rev-parse HEAD))"
 
             sf sgd source delta \
               --from "$FROM_COMMIT" \
@@ -187,7 +251,6 @@ jobs:
               --generate-delta
 
             echo "===== GENERATED PACKAGE.XML ====="
-
             if [ -f delta/package/package.xml ]; then
               cat delta/package/package.xml
             else
@@ -197,13 +260,12 @@ jobs:
             HAS_DELTA="false"
             HAS_CHANGES="false"
 
-            if [ -f delta/package/package.xml ] &&
+            if [ -f delta/package/package.xml ] && \
                grep -q "<members>" delta/package/package.xml; then
               HAS_DELTA="true"
               HAS_CHANGES="true"
             fi
 
-            # Check whether destructive change manifests were generated.
             for FILE in \
               delta/destructiveChanges/destructiveChanges.xml \
               delta/destructiveChanges/destructiveChangesPre.xml \
@@ -211,10 +273,13 @@ jobs:
               delta/destructiveChanges/preDestructiveChanges.xml \
               delta/destructiveChanges/postDestructiveChanges.xml
             do
-              if [ -f "$FILE" ]; then
+              if [ -s "$FILE" ]; then
                 HAS_CHANGES="true"
               fi
             done
+
+            # This marker is persisted with the delta and checked by the deploy job.
+            git rev-parse HEAD > .circleci-validated-commit
 
             {
               echo "export HAS_DELTA='${HAS_DELTA}'"
@@ -223,8 +288,7 @@ jobs:
 
             echo "HAS_DELTA=${HAS_DELTA}"
             echo "HAS_CHANGES=${HAS_CHANGES}"
-      
-      
+
       # -----------------------------------------------
       # 4. PMD SCAN, REPORT AND QUALITY GATE
       # -----------------------------------------------
@@ -327,33 +391,112 @@ jobs:
               printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
             }
 
-            # Generate HTML report
+            # Generate a downloadable HTML dashboard with colored KPI cards and severity chart.
+            TOTAL_SAFE=$((TOTAL_COUNT > 0 ? TOTAL_COUNT : 1))
+            HIGH_WIDTH=$(awk -v n="$HIGH_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
+            MEDIUM_WIDTH=$(awk -v n="$MEDIUM_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
+            LOW_WIDTH=$(awk -v n="$LOW_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
+            UNKNOWN_WIDTH=$(awk -v n="$UNKNOWN_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
+
+            if [ "$SCAN_STATUS" -ne 0 ] || [ "$PARSE_STATUS" -ne 0 ]; then
+              GATE_LABEL="SCAN ERROR"
+              GATE_CLASS="status-error"
+            elif [ "$HIGH_COUNT" -gt 0 ]; then
+              GATE_LABEL="FAILED - HIGH SEVERITY FINDINGS"
+              GATE_CLASS="status-failed"
+            else
+              GATE_LABEL="PASSED - NO HIGH SEVERITY FINDINGS"
+              GATE_CLASS="status-passed"
+            fi
+
             {
-              echo '<!doctype html>'
-              echo '<html><head><meta charset="utf-8">'
-              echo '<meta name="viewport" content="width=device-width, initial-scale=1">'
-              echo '<title>Salesforce PMD Scan Report</title>'
-              echo '<style>'
-              echo 'body{font-family:Arial,sans-serif;margin:24px;color:#222}'
-              echo '.card{display:inline-block;padding:16px;margin:6px;border-radius:8px;color:white;font-weight:bold}'
-              echo '.high{background:#c62828}.medium{background:#f9a825;color:#222}.low{background:#2e7d32}.unknown{background:#616161}'
-              echo 'table{border-collapse:collapse;width:100%;margin-top:20px}'
-              echo 'td,th{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}'
-              echo 'th{background:#f2f2f2}'
-              echo '.severity-high{color:#c62828;font-weight:bold}'
-              echo '.severity-medium{color:#9a6700;font-weight:bold}'
-              echo '.severity-low{color:#2e7d32;font-weight:bold}'
-              echo 'code{overflow-wrap:anywhere}'
-              echo '</style></head><body>'
-              echo '<h1>Salesforce PMD Scan Report</h1>'
-              printf '<p><strong>Scan mode:</strong> %s</p>\n' "$SCAN_MODE"
-              printf '<p><strong>Scan target:</strong> %s</p>\n' "$TARGET_PATH"
-              printf '<div class="card high">High: %s</div>\n' "$HIGH_COUNT"
-              printf '<div class="card medium">Medium: %s</div>\n' "$MEDIUM_COUNT"
-              printf '<div class="card low">Low: %s</div>\n' "$LOW_COUNT"
-              printf '<div class="card unknown">Unknown: %s</div>\n' "$UNKNOWN_COUNT"
-              echo '<table><thead><tr><th>Severity</th><th>Rule</th><th>Message</th><th>Apex Class / File</th><th>Line</th><th>Column</th><th>Documentation</th></tr></thead><tbody>'
-            } > pmd-output/pmd-summary.html
+              cat <<HTML
+            <!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Salesforce PMD Quality Dashboard</title>
+              <style>
+                *{box-sizing:border-box}
+                body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#f4f6fa;color:#202938}
+                .container{max-width:1280px;margin:0 auto;padding:28px}
+                .header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}
+                h1{margin:0 0 8px;font-size:28px}
+                .muted{color:#64748b;font-size:13px;line-height:1.6}
+                .status{padding:10px 14px;border-radius:8px;font-size:12px;font-weight:800;letter-spacing:.3px}
+                .status-passed{background:#dcfce7;color:#166534;border:1px solid #86efac}
+                .status-failed,.status-error{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
+                .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:26px 0}
+                .card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;box-shadow:0 2px 8px rgba(15,23,42,.04)}
+                .card-label{font-size:12px;text-transform:uppercase;letter-spacing:.7px;font-weight:700;color:#64748b}
+                .card-value{font-size:34px;font-weight:800;margin-top:9px}
+                .card.high{border-top:5px solid #dc2626}.card.medium{border-top:5px solid #f59e0b}.card.low{border-top:5px solid #16a34a}.card.unknown{border-top:5px solid #64748b}.card.total{border-top:5px solid #2563eb}
+                .high .card-value{color:#b91c1c}.medium .card-value{color:#b45309}.low .card-value{color:#15803d}.unknown .card-value{color:#475569}.total .card-value{color:#1d4ed8}
+                .panel{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin:18px 0;box-shadow:0 2px 8px rgba(15,23,42,.04)}
+                h2{font-size:18px;margin:0 0 18px}
+                .bar-row{display:grid;grid-template-columns:100px 1fr 55px;gap:12px;align-items:center;margin:14px 0;font-size:13px}
+                .track{height:14px;background:#edf2f7;border-radius:99px;overflow:hidden}
+                .fill{height:100%;border-radius:99px;min-width:0}
+                .fill.high{background:#dc2626}.fill.medium{background:#f59e0b}.fill.low{background:#16a34a}.fill.unknown{background:#64748b}
+                .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;font-size:13px}
+                .meta div{padding:10px;background:#f8fafc;border-radius:8px;overflow-wrap:anywhere}
+                .table-wrap{overflow-x:auto}
+                table{border-collapse:collapse;width:100%;min-width:900px;font-size:13px}
+                th,td{border-bottom:1px solid #e2e8f0;padding:11px 10px;text-align:left;vertical-align:top}
+                th{background:#f8fafc;color:#475569;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+                .pill{display:inline-block;padding:4px 8px;border-radius:99px;font-weight:800;font-size:11px}
+                .pill-high{background:#fee2e2;color:#991b1b}.pill-medium{background:#fef3c7;color:#92400e}.pill-low{background:#dcfce7;color:#166534}.pill-unknown{background:#e2e8f0;color:#334155}
+                code{overflow-wrap:anywhere}
+                a{color:#1d4ed8}
+                .footer{color:#64748b;font-size:12px;margin:22px 0}
+                @media(max-width:600px){.container{padding:16px}.bar-row{grid-template-columns:78px 1fr 38px;gap:8px}.card-value{font-size:28px}}
+              </style>
+            </head>
+            <body>
+              <main class="container">
+                <section class="header">
+                  <div>
+                    <h1>Salesforce PMD Quality Dashboard</h1>
+                    <div class="muted">Generated by Salesforce Code Analyzer in CircleCI</div>
+                  </div>
+                  <div class="status ${GATE_CLASS}">${GATE_LABEL}</div>
+                </section>
+                <section class="grid">
+                  <div class="card total"><div class="card-label">Total findings</div><div class="card-value">${TOTAL_COUNT}</div></div>
+                  <div class="card high"><div class="card-label">High severity</div><div class="card-value">${HIGH_COUNT}</div></div>
+                  <div class="card medium"><div class="card-label">Medium severity</div><div class="card-value">${MEDIUM_COUNT}</div></div>
+                  <div class="card low"><div class="card-label">Low severity</div><div class="card-value">${LOW_COUNT}</div></div>
+                  <div class="card unknown"><div class="card-label">Unknown severity</div><div class="card-value">${UNKNOWN_COUNT}</div></div>
+                </section>
+                <section class="panel">
+                  <h2>Severity distribution</h2>
+                  <div class="bar-row"><strong>High</strong><div class="track"><div class="fill high" style="width:${HIGH_WIDTH}%"></div></div><strong>${HIGH_COUNT}</strong></div>
+                  <div class="bar-row"><strong>Medium</strong><div class="track"><div class="fill medium" style="width:${MEDIUM_WIDTH}%"></div></div><strong>${MEDIUM_COUNT}</strong></div>
+                  <div class="bar-row"><strong>Low</strong><div class="track"><div class="fill low" style="width:${LOW_WIDTH}%"></div></div><strong>${LOW_COUNT}</strong></div>
+                  <div class="bar-row"><strong>Unknown</strong><div class="track"><div class="fill unknown" style="width:${UNKNOWN_WIDTH}%"></div></div><strong>${UNKNOWN_COUNT}</strong></div>
+                </section>
+                <section class="panel">
+                  <h2>Scan details</h2>
+                  <div class="meta">
+                    <div><strong>Scan mode:</strong> ${SCAN_MODE}</div>
+                    <div><strong>Scan target:</strong> ${TARGET_PATH}</div>
+                    <div><strong>Scanner exit code:</strong> ${SCAN_STATUS}</div>
+                    <div><strong>Report parsing status:</strong> ${PARSE_STATUS}</div>
+                    <div><strong>Quality gate:</strong> ${GATE_LABEL}</div>
+                  </div>
+                </section>
+                <section class="panel">
+                  <h2>Detailed findings</h2>
+                  <div class="table-wrap">
+                    <table>
+                      <thead><tr><th>Severity</th><th>Rule</th><th>Message</th><th>Apex class / file</th><th>Line</th><th>Column</th><th>Documentation</th></tr></thead>
+                      <tbody>
+            HTML
+            } > pmd-output/pmd-dashboard.html
+
+            # Keep the detailed report filename as a compatibility copy of the dashboard.
+            cp pmd-output/pmd-dashboard.html pmd-output/pmd-summary.html
 
             # Read each normalized finding
             while IFS= read -r FINDING; do
@@ -380,10 +523,10 @@ jobs:
               APEX_CLASS=$(html_escape "$APEX_CLASS")
 
               case "$SEVERITY" in
-                High) CSS_CLASS="severity-high" ;;
-                Medium) CSS_CLASS="severity-medium" ;;
-                Low) CSS_CLASS="severity-low" ;;
-                *) CSS_CLASS="" ;;
+                High) CSS_CLASS="pill-high" ;;
+                Medium) CSS_CLASS="pill-medium" ;;
+                Low) CSS_CLASS="pill-low" ;;
+                *) CSS_CLASS="pill-unknown" ;;
               esac
 
               # Prefer the direct documentation URL included in the finding.
@@ -396,17 +539,21 @@ jobs:
                 esac
               fi
 
-              printf '<tr><td class="%s">%s</td><td>%s</td><td>%s</td><td><strong>%s</strong><br><small><code>%s</code></small></td><td>%s</td><td>%s</td><td><a href="%s" target="_blank" rel="noopener noreferrer">View documentation</a></td></tr>\n' \
+              printf '<tr><td><span class="pill %s">%s</span></td><td>%s</td><td>%s</td><td><strong>%s</strong><br><small><code>%s</code></small></td><td>%s</td><td>%s</td><td><a href="%s" target="_blank" rel="noopener noreferrer">View documentation</a></td></tr>\n' \
                 "$CSS_CLASS" "$SEVERITY" "$RULE" "$MESSAGE" "$APEX_CLASS" "$FILE_NAME" "$LINE" "$COLUMN" "$DOC_URL" \
-                >> pmd-output/pmd-summary.html
+                >> pmd-output/pmd-dashboard.html
 
             done < <(jq -c '.[]' pmd-output/classified.json)
 
             {
               echo '</tbody></table>'
-              echo '<p>Generated by Salesforce Code Analyzer in CircleCI.</p>'
-              echo '</body></html>'
-            } >> pmd-output/pmd-summary.html
+              echo '</div>'
+              echo '<p class="footer">Generated by Salesforce Code Analyzer in CircleCI. High severity findings block the pipeline; Medium, Low and Unknown severity findings are reported but do not block deployment.</p>'
+              echo '</section>'
+              echo '</main></body></html>'
+            } >> pmd-output/pmd-dashboard.html
+
+            cp pmd-output/pmd-dashboard.html pmd-output/pmd-summary.html
 
             # Save useful diagnostic details
             if grep -q 'Location unavailable' pmd-output/pmd-summary.html; then
@@ -421,16 +568,21 @@ jobs:
             echo "             PMD QUALITY GATE"
             echo "============================================"
 
-            if [ "$SCAN_STATUS" -ne 0 ]; then
-              echo "FAILED: Code Analyzer returned an error."
-            elif [ "$PARSE_STATUS" -ne 0 ]; then
-              echo "FAILED: PMD report could not be parsed."
-            elif [ "$UNKNOWN_COUNT" -gt 0 ]; then
-              echo "FAILED: Unknown severity findings detected."
-            elif [ "$HIGH_COUNT" -gt 0 ]; then
-              echo "FAILED: High-severity findings detected."
+            # Only High severity findings block the pipeline.
+            # Medium, Low and Unknown findings remain visible in the dashboard.
+            if [ "$SCAN_STATUS" -ne 0 ] || [ "$PARSE_STATUS" -ne 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
+              PMD_GATE_FAILED="true"
+              if [ "$SCAN_STATUS" -ne 0 ]; then
+                echo "FAILED: Code Analyzer returned an error."
+              elif [ "$PARSE_STATUS" -ne 0 ]; then
+                echo "FAILED: PMD report could not be parsed."
+              else
+                echo "FAILED: High-severity findings detected."
+              fi
             else
+              PMD_GATE_FAILED="false"
               echo "PASSED: No High-severity findings detected."
+              echo "Medium, Low and Unknown severity findings do not block the pipeline."
             fi
 
             {
@@ -440,22 +592,30 @@ jobs:
               echo "export PMD_MEDIUM_COUNT='${MEDIUM_COUNT}'"
               echo "export PMD_LOW_COUNT='${LOW_COUNT}'"
               echo "export PMD_UNKNOWN_COUNT='${UNKNOWN_COUNT}'"
+              echo "export PMD_GATE_FAILED='${PMD_GATE_FAILED}'"
             } >> "$BASH_ENV"
 
-            if [ "$SCAN_STATUS" -ne 0 ] || [ "$PARSE_STATUS" -ne 0 ] || [ "$UNKNOWN_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
-              exit 1
-            fi
-
+            # Do not fail this step yet. Upload the dashboard first.
             exit 0
 
       # -----------------------------------------------
-      #  5. Publish PMD reports as CircleCI artifacts
-      # Keep after the PMD step; configure an always-run
-      # artifact upload approach if PMD failures must also upload reports.
+      # 5. Publish PMD dashboard and raw reports.
+      # This runs before the quality-gate enforcement step,
+      # so the report is available even when High findings exist.
       # -----------------------------------------------
       - store_artifacts:
           path: pmd-output
-          destination: salesforce-pmd-report   
+          destination: salesforce-pmd-report
+
+      - run:
+          name: Enforce PMD Quality Gate
+          command: |
+            set -euo pipefail
+            if [ "${PMD_GATE_FAILED:-true}" = "true" ]; then
+              echo "PMD QUALITY GATE FAILED. Review the downloadable pmd-dashboard.html artifact."
+              exit 1
+            fi
+            echo "PMD QUALITY GATE PASSED. Continuing to Salesforce validation/deployment."
 
       # -----------------------------------------------
       # 6. AUTHENTICATE TO THE TARGET ORG
@@ -655,6 +815,16 @@ jobs:
             echo "SUCCESS: Salesforce dry-run validation completed."
             echo "============================================"
 
+      - when:
+          condition:
+            equal: [true, << parameters.persist_validated_artifact >>]
+          steps:
+            - persist_to_workspace:
+                root: ~/project
+                paths:
+                  - delta
+                  - .circleci-validated-commit
+
       # -----------------------------------------------
       # 8. SALESFORCE ACTUAL DEPLOYMENT
       # -----------------------------------------------
@@ -801,14 +971,9 @@ jobs:
           command: |
             rm -f circleci.key
 
-
 workflows:
-  version: 2
-
-  # -----------------------------------------------
-  # PR VALIDATION
-  # -----------------------------------------------
-  pull_request_validation:
+  # 1. Pull Request Validation
+  pr-validation:
     jobs:
       - deploy:
           name: validate-pull-request
@@ -820,13 +985,28 @@ workflows:
           mode: validate
           filters:
             branches:
-              only: /^(feature|release|sprint|HotFix)\/.+$/
+              only:
+                - /feature\/.*/
+                - /release\/.*/
+                - /sprint\/.*/
+                - /HotFix\/.*/
 
-  # -----------------------------------------------
-  # QA DEPLOYMENT
-  # -----------------------------------------------
-  deploy_qa:
+  # 2. QA - Automatic deployment after PR merge
+  deploy-qa:
     jobs:
+      - deploy:
+          name: validate-qa
+          username: SF_QA_USERNAME
+          client_id: SF_QA_CLIENT_ID
+          instance_url: SF_QA_INSTANCE_URL
+          jwt_key: JWT_KEY_QA
+          environment: qa
+          mode: validate
+          persist_validated_artifact: true
+          filters:
+            branches:
+              only: qa
+
       - deploy:
           name: deploy-qa
           username: SF_QA_USERNAME
@@ -835,15 +1015,37 @@ workflows:
           jwt_key: JWT_KEY_QA
           environment: qa
           mode: deploy
+          use_validated_artifact: true
+          requires:
+            - validate-qa
           filters:
             branches:
               only: qa
 
-  # -----------------------------------------------
-  # UAT DEPLOYMENT
-  # -----------------------------------------------
-  deploy_uat:
+  # 3. UAT - Manual approval before deployment
+  deploy-uat:
     jobs:
+      - deploy:
+          name: validate-uat
+          username: SF_UAT_USERNAME
+          client_id: SF_UAT_CLIENT_ID
+          instance_url: SF_UAT_INSTANCE_URL
+          jwt_key: JWT_KEY_UAT
+          environment: uat
+          mode: validate
+          persist_validated_artifact: true
+          filters:
+            branches:
+              only: uat
+
+      - approve-uat:
+          type: approval
+          requires:
+            - validate-uat
+          filters:
+            branches:
+              only: uat
+
       - deploy:
           name: deploy-uat
           username: SF_UAT_USERNAME
@@ -852,14 +1054,15 @@ workflows:
           jwt_key: JWT_KEY_UAT
           environment: uat
           mode: deploy
+          use_validated_artifact: true
+          requires:
+            - approve-uat
           filters:
             branches:
               only: uat
 
-  # -----------------------------------------------
-  # PRODUCTION VALIDATION, APPROVAL AND DEPLOYMENT
-  # -----------------------------------------------
-  deploy_production:
+  # 4. Production - Manual approval before deployment
+  deploy-production:
     jobs:
       - deploy:
           name: validate-production
@@ -869,6 +1072,7 @@ workflows:
           jwt_key: JWT_KEY_PROD
           environment: prod
           mode: validate
+          persist_validated_artifact: true
           filters:
             branches:
               only: main
@@ -889,10 +1093,9 @@ workflows:
           jwt_key: JWT_KEY_PROD
           environment: prod
           mode: deploy
+          use_validated_artifact: true
           requires:
             - approve-prod
           filters:
             branches:
               only: main
-              
-              
