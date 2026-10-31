@@ -32,7 +32,7 @@ private class AccountServiceTest {
 
     List<Account> verifiedAccounts = [SELECT Id, Description FROM Account];
 
-    // PMD / Salesforce best practice: Use Assert methods with messages or modern syntax
+    // PMD / Salesforce best practice: Use Assert methods with messages or modern syntax hii
     for (Account acc : verifiedAccounts) {
       Assert.areEqual(
         updatedDescription,
