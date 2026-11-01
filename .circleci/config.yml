@@ -80,10 +80,10 @@ jobs:
             sf code-analyzer --help
 
       # -----------------------------------------------
-      # 2. RESOLVE TARGET ENVIRONMENT
+      #  2. IDENTIFY PR TARGET AND SALESFORCE ENVIRONMENT
       # -----------------------------------------------
       - run:
-          name: Resolve Target Environment
+          name: Identify PR Target And Salesforce Environment
           command: |
             set -euo pipefail
 
@@ -102,19 +102,17 @@ jobs:
                 exit 1
               fi
 
-              if [ -z "${GH_API_TOKEN:-}" ]; then
-                echo "ERROR: GH_API_TOKEN is not configured."
+              
+              # Get the target branch directly from CircleCI GitHub App event
+              BASE_BRANCH="<< pipeline.event.github.pull_request.base.ref >>"
+
+              if [ -z "$BASE_BRANCH" ] || [ "$BASE_BRANCH" = "<nil>" ]; then
+                echo "ERROR: Unable to identify PR target branch."
                 exit 1
               fi
 
-              PR_NUMBER="${CIRCLE_PULL_REQUEST##*/}"
+              echo "Pull Request target branch: $BASE_BRANCH"
 
-              PR_JSON=$(curl -fsSL \
-                -H "Authorization: Bearer ${GH_API_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls/${PR_NUMBER}")
-
-              BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
 
               case "$BASE_BRANCH" in
                 qa|uat|main)
