@@ -76,6 +76,25 @@ jobs:
             MODE="<< parameters.mode >>"
             ENVIRONMENT="<< parameters.environment >>"
 
+            # Safety guard: deployment is allowed only from its matching
+            # protected target branch. Feature-branch deployment is skipped.
+            if [ "$MODE" = "deploy" ]; then
+              case "${CIRCLE_BRANCH:-}:$ENVIRONMENT" in
+                qa:qa|uat:uat|main:prod)
+                  echo "Approved deployment branch: $CIRCLE_BRANCH"
+                  ;;
+                feature/*:*)
+                  echo "Feature branch detected ($CIRCLE_BRANCH). Skipping deployment job steps."
+                  circleci-agent step halt
+                  exit 0
+                  ;;
+                *)
+                  echo "ERROR: Deployment is not permitted from branch '${CIRCLE_BRANCH:-unknown}' to environment '$ENVIRONMENT'."
+                  exit 1
+                  ;;
+              esac
+            fi
+
             IS_PR="false"
             BASE_BRANCH=""
 
@@ -600,13 +619,32 @@ jobs:
             printf '%s' "$JWT_B64" | base64 --decode > "$KEY_FILE"
             chmod 600 "$KEY_FILE"
 
+            ORGALIAS="targetorg"
+
+            echo "============================================"
+            echo "SALESFORCE JWT AUTHENTICATION"
+            echo "============================================"
+            echo "Authenticating Salesforce user: $USERNAME"
+            echo "Target instance URL: $INSTANCE_URL"
+
             sf org login jwt \
               --client-id "$CLIENT_ID" \
               --jwt-key-file "$KEY_FILE" \
               --username "$USERNAME" \
               --instance-url "$INSTANCE_URL" \
-              --alias targetorg
+              --alias "$ORGALIAS"
 
+            echo ""
+            echo "JWT authentication successful."
+            echo "Authenticated Org Alias: $ORGALIAS"
+            echo "Verifying authenticated Salesforce org..."
+
+            sf org display --target-org "$ORGALIAS" || {
+              echo "ERROR: Salesforce org authentication verification failed."
+              exit 1
+            }
+
+            echo "Salesforce authentication verification completed."
             rm -f "$KEY_FILE"
 
       # -----------------------------------------------
@@ -633,7 +671,24 @@ jobs:
 
             echo "Environment : $TARGET_ENVIRONMENT"
             echo "Mode        : $PIPELINE_MODE"
-            echo "Test level  : RunLocalTests"
+
+            # QA/UAT were already validated in the PR pipeline. Do not rerun
+            # Apex tests during their actual deployment. Production retains
+            # Salesforce-required local test execution.
+            case "$TARGET_ENVIRONMENT" in
+              qa|uat)
+                TEST_LEVEL="NoTestRun"
+                ;;
+              prod)
+                TEST_LEVEL="RunLocalTests"
+                ;;
+              *)
+                echo "ERROR: Unsupported deployment environment: $TARGET_ENVIRONMENT"
+                exit 1
+                ;;
+            esac
+
+            echo "Apex test level: $TEST_LEVEL"
 
             # ---------------------------------------
             # Detect pre-destructive changes
@@ -760,6 +815,23 @@ jobs:
               exit 0
             fi
 
+            # Final deployment safety check. Never deploy from feature branches
+            # or deploy to an environment that does not match the branch.
+            case "${CIRCLE_BRANCH:-}:$TARGET_ENVIRONMENT" in
+              qa:qa|uat:uat|main:prod)
+                echo "Deployment branch/environment check passed."
+                ;;
+              feature/*:*)
+                echo "Feature branch detected ($CIRCLE_BRANCH). Skipping Salesforce deployment."
+                circleci-agent step halt
+                exit 0
+                ;;
+              *)
+                echo "ERROR: Branch '${CIRCLE_BRANCH:-unknown}' cannot deploy to '$TARGET_ENVIRONMENT'."
+                exit 1
+                ;;
+            esac
+
             PKG_FILE="delta/package/package.xml"
             PRE_XML=""
             POST_XML=""
@@ -875,7 +947,7 @@ jobs:
             sf project deploy start \
               "${DEPLOY_ARGS[@]}" \
               --target-org targetorg \
-              --test-level RunLocalTests \
+              --test-level "$TEST_LEVEL" \
               --wait 800 \
               --ignore-warnings \
               --verbose
