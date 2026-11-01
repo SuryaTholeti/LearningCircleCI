@@ -922,7 +922,9 @@ workflows:
   deploy-qa:
     when:
       and:
-        - equal: [push, << pipeline.event.name >>]
+        - equal: [pull_request, << pipeline.event.name >>]
+        - equal: [closed, << pipeline.event.action >>]
+        - equal: [true, << pipeline.event.github.pull_request.merged >>]
         - equal: [qa, << pipeline.git.branch >>]
     jobs:
       - approve-qa:
@@ -949,7 +951,9 @@ workflows:
   deploy-uat:
     when:
       and:
-        - equal: [push, << pipeline.event.name >>]
+        - equal: [pull_request, << pipeline.event.name >>]
+        - equal: [closed, << pipeline.event.action >>]
+        - equal: [true, << pipeline.event.github.pull_request.merged >>]
         - equal: [uat, << pipeline.git.branch >>]
     jobs:
       - approve-uat:
@@ -976,7 +980,9 @@ workflows:
   deploy-production:
     when:
       and:
-        - equal: [push, << pipeline.event.name >>]
+        - equal: [pull_request, << pipeline.event.name >>]
+        - equal: [closed, << pipeline.event.action >>]
+        - equal: [true, << pipeline.event.github.pull_request.merged >>]
         - equal: [main, << pipeline.git.branch >>]
     jobs:
       - approve-prod:
