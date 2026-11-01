@@ -568,7 +568,7 @@ jobs:
                   fi
                   echo "PMD QUALITY GATE PASSED. Continuing to Salesforce validation/deployment."
 
-      # -----------------------------------------------
+            # -----------------------------------------------
       # 6. AUTHENTICATE TO THE TARGET ORG
       # -----------------------------------------------
       - run:
@@ -576,76 +576,75 @@ jobs:
           command: |
             set -euo pipefail
 
+            # Select Salesforce credentials based on target environment
             case "$TARGET_ENVIRONMENT" in
               qa)
-                USERNAME_ENV="SF_QA_USERNAME"
-                CLIENT_ID_ENV="SF_QA_CLIENT_ID"
-                INSTANCE_URL_ENV="SF_QA_INSTANCE_URL"
-                JWT_ENV="JWT_KEY_QA"
+                USERNAME_ENV="SF_QA_USERNAME"; CLIENT_ID_ENV="SF_QA_CLIENT_ID"; INSTANCE_URL_ENV="SF_QA_INSTANCE_URL"; JWT_ENV="JWT_KEY_QA"; ORGALIAS="QAorg"
                 ;;
               uat)
-                USERNAME_ENV="SF_UAT_USERNAME"
-                CLIENT_ID_ENV="SF_UAT_CLIENT_ID"
-                INSTANCE_URL_ENV="SF_UAT_INSTANCE_URL"
-                JWT_ENV="JWT_KEY_UAT"
+                USERNAME_ENV="SF_UAT_USERNAME"; CLIENT_ID_ENV="SF_UAT_CLIENT_ID"; INSTANCE_URL_ENV="SF_UAT_INSTANCE_URL"; JWT_ENV="JWT_KEY_UAT"; ORGALIAS="UATorg"
                 ;;
               prod)
-                USERNAME_ENV="SF_PROD_USERNAME"
-                CLIENT_ID_ENV="SF_PROD_CLIENT_ID"
-                INSTANCE_URL_ENV="SF_PROD_INSTANCE_URL"
-                JWT_ENV="JWT_KEY_PROD"
+                USERNAME_ENV="SF_PROD_USERNAME"; CLIENT_ID_ENV="SF_PROD_CLIENT_ID"; INSTANCE_URL_ENV="SF_PROD_INSTANCE_URL"; JWT_ENV="JWT_KEY_PROD"; ORGALIAS="PRODorg"
                 ;;
               *)
-                echo "ERROR: Unsupported target environment."
+                echo "ERROR: Unsupported target environment: $TARGET_ENVIRONMENT"
                 exit 1
                 ;;
             esac
 
+            # Retrieve environment variables dynamically
             USERNAME="${!USERNAME_ENV:-}"
             CLIENT_ID="${!CLIENT_ID_ENV:-}"
             INSTANCE_URL="${!INSTANCE_URL_ENV:-}"
             JWT_B64="${!JWT_ENV:-}"
 
-            if [ -z "$USERNAME" ] ||
-               [ -z "$CLIENT_ID" ] ||
-               [ -z "$INSTANCE_URL" ] ||
-               [ -z "$JWT_B64" ]; then
+            # Validate required credentials
+            if [ -z "$USERNAME" ] || [ -z "$CLIENT_ID" ] || [ -z "$INSTANCE_URL" ] || [ -z "$JWT_B64" ]; then
               echo "ERROR: One or more Salesforce environment variables are missing."
               exit 1
             fi
 
+            # Decode JWT private key
             KEY_FILE="$PWD/circleci.key"
+            trap 'rm -f "$KEY_FILE"' EXIT
 
             printf '%s' "$JWT_B64" | base64 --decode > "$KEY_FILE"
             chmod 600 "$KEY_FILE"
 
-            ORGALIAS="targetorg"
-
+            echo ""
             echo "============================================"
             echo "SALESFORCE JWT AUTHENTICATION"
             echo "============================================"
             echo "Authenticating Salesforce user: $USERNAME"
             echo "Target instance URL: $INSTANCE_URL"
 
-            sf org login jwt \
-              --client-id "$CLIENT_ID" \
-              --jwt-key-file "$KEY_FILE" \
-              --username "$USERNAME" \
-              --instance-url "$INSTANCE_URL" \
-              --alias "$ORGALIAS"
+            # Authenticate Salesforce using JWT
+            sf org login jwt --client-id "$CLIENT_ID" --jwt-key-file "$KEY_FILE" --username "$USERNAME" --instance-url "$INSTANCE_URL" --alias "$ORGALIAS"
 
+            # Verify authenticated Salesforce org
             echo ""
-            echo "JWT authentication successful."
-            echo "Authenticated Org Alias: $ORGALIAS"
-            echo "Verifying authenticated Salesforce org..."
+            echo "🔍 Verifying authenticated Salesforce org..."
 
-            sf org display --target-org "$ORGALIAS" || {
-              echo "ERROR: Salesforce org authentication verification failed."
+            ORG_DETAILS=$(sf org display --target-org "$ORGALIAS" --json) || {
+              echo "❌ Salesforce org authentication verification failed."
               exit 1
             }
 
-            echo "Salesforce authentication verification completed."
-            rm -f "$KEY_FILE"
+            # Extract only org alias and username
+            ORG_ALIAS=$(echo "$ORG_DETAILS" | jq -r '.result.alias // empty')
+            ORG_USERNAME=$(echo "$ORG_DETAILS" | jq -r '.result.username // empty')
+
+            if [ -z "$ORG_ALIAS" ] || [ -z "$ORG_USERNAME" ]; then
+              echo "❌ Unable to retrieve authenticated org alias or username."
+              exit 1
+            fi
+
+            echo ""
+            echo "🔐 Authenticated Org Alias: $ORG_ALIAS"
+            echo "👤 Salesforce Username: $ORG_USERNAME"
+            echo ""
+            echo "✅ Salesforce authentication verification completed."
 
       # -----------------------------------------------
       # 7. SALESFORCE DRY-RUN VALIDATION
