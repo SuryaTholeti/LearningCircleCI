@@ -513,6 +513,22 @@ jobs:
             echo "Mode        : $PIPELINE_MODE"
             echo "Test level  : RunLocalTests"
 
+            # Select Apex test level based on target environment
+            case "$TARGET_ENVIRONMENT" in
+              qa|uat)
+                TEST_LEVEL="NoTestRun"
+                ;;
+              prod)
+                TEST_LEVEL="RunLocalTests"
+                ;;
+              *)
+                echo "ERROR: Unsupported environment: $TARGET_ENVIRONMENT"
+                exit 1
+                ;;
+            esac
+
+            echo "Selected Apex test level: $TEST_LEVEL"
+
             # ---------------------------------------
             # Detect pre-destructive changes
             # ---------------------------------------
