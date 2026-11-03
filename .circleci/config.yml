@@ -289,7 +289,7 @@ jobs:
                     exit 1
                   fi
                   SELECTED_MODE="RunSpecifiedTests"
-                  IFS=',' read -r -a CLASS_NAMES <<< "$VALUE"
+                  IFS=',' read -r -a CLASS_NAMES < <(printf '%s' "$VALUE")
                   for CLASS_NAME in "${CLASS_NAMES[@]}"; do
                     SELECTED_CLASSES["$CLASS_NAME"]=1
                   done
@@ -521,7 +521,7 @@ jobs:
             echo "Starting Salesforce dry-run validation..."
 
             if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
-              IFS=',' read -r -a TEST_CLASSES <<< "$TEST_CLASSES_CSV"  
+              IFS=',' read -r -a CLASS_NAMES < <(printf '%s' "$VALUE")   
               sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level RunSpecifiedTests --tests "${TEST_CLASSES[@]}" --dry-run --wait 800 --ignore-warnings --verbose
             else
               sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level "$TEST_LEVEL" --dry-run --wait 800 --ignore-warnings --verbose
@@ -677,7 +677,7 @@ jobs:
             echo "Starting Salesforce actual deployment..."
 
             if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
-              IFS=',' read -r -a TEST_CLASSES <<< "$TEST_CLASSES_CSV"
+              IFS=',' read -r -a TEST_CLASSES < <(printf '%s' "$TEST_CLASSES_CSV")
               sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level RunSpecifiedTests --tests "${TEST_CLASSES[@]}" --wait 800 --ignore-warnings --verbose
             else
               sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level "$TEST_LEVEL" --wait 800 --ignore-warnings --verbose
