@@ -239,106 +239,174 @@ jobs:
           command: |
             set -euo pipefail
 
-            # Environment defaults when no [TEST=...] directive is present.
+            # -----------------------------------------------
+            # 1. SET DEFAULT TEST LEVEL BASED ON ENVIRONMENT
+            # -----------------------------------------------
+
             case "$TARGET_ENVIRONMENT" in
-              dev|qa) DEFAULT_TEST_LEVEL="NoTestRun" ;;
-              uat|prod) DEFAULT_TEST_LEVEL="RunLocalTests" ;;
+              dev) DEFAULT_TEST_LEVEL="NoTestRun" ;;
+              qa|uat|prod) DEFAULT_TEST_LEVEL="RunLocalTests" ;;
               *) echo "ERROR: Unsupported environment: $TARGET_ENVIRONMENT"; exit 1 ;;
             esac
 
-            # Inspect every commit included in this delta (including PR commits
-            # reachable from a merge commit), not unrelated older history.
+            # -----------------------------------------------
+            # 2. VERIFY COMMIT RANGE
+            # -----------------------------------------------
+
             if [ -z "${FROM_COMMIT:-}" ]; then
               echo "ERROR: FROM_COMMIT is not available for test selection."
               exit 1
             fi
 
-            mapfile -t TEST_TOKENS < <(git log --format=%B "${FROM_COMMIT}..HEAD" | grep -oE '\[TEST=[^]]+\]' || true)
-
             echo "============================================"
-            echo "DEBUG: APEX TEST SELECTION"
+            echo "APEX TEST SELECTION"
             echo "============================================"
             echo "Target environment: $TARGET_ENVIRONMENT"
             echo "From commit: $FROM_COMMIT"
             echo "Current commit: $(git rev-parse HEAD)"
-            echo "Commit messages in selected range:"
-            git log --format='%h %s' "${FROM_COMMIT}..HEAD"
+
+            # -----------------------------------------------
+            # 3. COLLECT TEST DIRECTIVES FROM ALL COMMITS
+            # -----------------------------------------------
+
+            mapfile -t TEST_TOKENS < <(
+              git log --format=%B "${FROM_COMMIT}..HEAD" |
+              grep -oE '\[TEST=[^]]+\]' || true
+            )
+
             echo "Detected test directives:"
             printf '%s\n' "${TEST_TOKENS[@]}"
+
+            # -----------------------------------------------
+            # 4. PROCESS TEST DIRECTIVES
+            # -----------------------------------------------
 
             SELECTED_MODE=""
             declare -A SELECTED_CLASSES=()
 
             for TOKEN in "${TEST_TOKENS[@]}"; do
+
               VALUE="${TOKEN#\[TEST=}"
               VALUE="${VALUE%\]}"
               VALUE="$(printf '%s' "$VALUE" | tr -d '[:space:]')"
 
               case "${VALUE^^}" in
+
                 NONE|SKIP)
+
+                  # Ignore NONE/SKIP directives only for production.
+                  if [ "$TARGET_ENVIRONMENT" = "prod" ]; then
+                    echo "WARNING: Ignoring $TOKEN for production."
+                    continue
+                  fi
+
                   if [ -n "$SELECTED_MODE" ] && [ "$SELECTED_MODE" != "NoTestRun" ]; then
                     echo "ERROR: Conflicting [TEST=...] directives found in commits."
                     exit 1
                   fi
+
                   SELECTED_MODE="NoTestRun"
                   ;;
+
                 ALL)
+
                   if [ -n "$SELECTED_MODE" ] && [ "$SELECTED_MODE" != "RunLocalTests" ]; then
                     echo "ERROR: Conflicting [TEST=...] directives found in commits."
                     exit 1
                   fi
+
                   SELECTED_MODE="RunLocalTests"
                   ;;
+
                 *)
+
+                  # Validate specified Apex test class names.
                   if ! [[ "$VALUE" =~ ^[A-Za-z_][A-Za-z0-9_]*(,[A-Za-z_][A-Za-z0-9_]*)*$ ]]; then
                     echo "ERROR: Invalid test directive: $TOKEN"
                     echo "Use [TEST=NONE], [TEST=SKIP], [TEST=ALL], or [TEST=ClassA,ClassB]."
                     exit 1
                   fi
+
                   if [ -n "$SELECTED_MODE" ] && [ "$SELECTED_MODE" != "RunSpecifiedTests" ]; then
                     echo "ERROR: Conflicting [TEST=...] directives found in commits."
                     exit 1
                   fi
+
                   SELECTED_MODE="RunSpecifiedTests"
+
+                  # Collect and deduplicate all specified test classes.
                   IFS=',' read -r -a CLASS_NAMES < <(printf '%s' "$VALUE")
+
                   for CLASS_NAME in "${CLASS_NAMES[@]}"; do
                     SELECTED_CLASSES["$CLASS_NAME"]=1
                   done
                   ;;
+
               esac
+
             done
+
+            # -----------------------------------------------
+            # 5. DETERMINE FINAL TEST LEVEL
+            # -----------------------------------------------
 
             TEST_LEVEL="${SELECTED_MODE:-$DEFAULT_TEST_LEVEL}"
             TEST_CLASSES_CSV=""
 
             if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
-              TEST_CLASSES_CSV="$(printf '%s\n' "${!SELECTED_CLASSES[@]}" | sort | paste -sd, -)"
+
+              TEST_CLASSES_CSV="$(
+                printf '%s\n' "${!SELECTED_CLASSES[@]}" | sort | paste -sd, -
+              )"
+
               if [ -z "$TEST_CLASSES_CSV" ]; then
                 echo "ERROR: RunSpecifiedTests selected without any test classes."
                 exit 1
               fi
+
             fi
 
-            # Salesforce production deployments must execute Apex tests.
+            # -----------------------------------------------
+            # 6. PRODUCTION SAFETY CHECK
+            # -----------------------------------------------
+
             if [ "$TARGET_ENVIRONMENT" = "prod" ] && [ "$TEST_LEVEL" = "NoTestRun" ]; then
               echo "ERROR: NoTestRun is not permitted for production deployments."
               exit 1
             fi
+
+            # -----------------------------------------------
+            # 7. EXPORT VARIABLES FOR NEXT CIRCLECI STEPS
+            # -----------------------------------------------
 
             {
               echo "export TEST_LEVEL='${TEST_LEVEL}'"
               echo "export TEST_CLASSES_CSV='${TEST_CLASSES_CSV}'"
             } >> "$BASH_ENV"
 
+            # -----------------------------------------------
+            # 8. DISPLAY FINAL TEST SELECTION
+            # -----------------------------------------------
+
+            echo "============================================"
+            echo "FINAL APEX TEST SELECTION"
+            echo "============================================"
+
+            echo "Target environment: $TARGET_ENVIRONMENT"
             echo "Selected Apex test level: $TEST_LEVEL"
+
             if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
               echo "Selected Apex test classes: $TEST_CLASSES_CSV"
             fi
+
             if [ "${#TEST_TOKENS[@]}" -eq 0 ]; then
               echo "No commit test directive found; using environment default."
             else
-              printf 'Detected commit directive(s): %s\n' "${TEST_TOKENS[@]}"
+              echo "Processed commit directives:"
+              printf '%s\n' "${TEST_TOKENS[@]}"
             fi
+
+            echo "============================================"
 
       # -----------------------------------------------
       # 7. AUTHENTICATE TO THE TARGET ORG
