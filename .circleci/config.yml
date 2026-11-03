@@ -241,8 +241,8 @@ jobs:
 
             # Environment defaults when no [TEST=...] directive is present.
             case "$TARGET_ENVIRONMENT" in
-              dev|qa) DEFAULT_TEST_LEVEL="NoTestRun" ;;
-              uat|prod) DEFAULT_TEST_LEVEL="RunLocalTests" ;;
+              dev) DEFAULT_TEST_LEVEL="NoTestRun" ;;
+              qa|uat|prod) DEFAULT_TEST_LEVEL="RunLocalTests" ;;
               *) echo "ERROR: Unsupported environment: $TARGET_ENVIRONMENT"; exit 1 ;;
             esac
 
