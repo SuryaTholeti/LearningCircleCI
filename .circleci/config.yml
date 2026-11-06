@@ -112,7 +112,7 @@ jobs:
 
 
               case "$BASE_BRANCH" in
-                dev|qa|uat|main)
+                dev|qa|uat|main|qabackup)
                   IS_PR="true"
                   ;;
                 *)
@@ -128,6 +128,7 @@ jobs:
                 qa) ENVIRONMENT="qa" ;;
                 uat) ENVIRONMENT="uat" ;;
                 main) ENVIRONMENT="prod" ;;
+                qabackup) ENVIRONMENT="qa" ;;
               esac
 
             else
@@ -356,7 +357,7 @@ jobs:
                   fi
 
                   {
-                    cat \<<HTML
+                    cat <<HTML
                   <!doctype html>
                   <html lang="en">
                   <head>
@@ -557,11 +558,21 @@ jobs:
                 name: Enforce PMD Quality Gate
                 command: |
                   set -euo pipefail
+
+                  # Enforce PMD quality gate
                   if [ "${PMD_GATE_FAILED:-true}" = "true" ]; then
-                    echo "PMD QUALITY GATE FAILED. Review the downloadable pmd-dashboard.html artifact."
+                    echo "PMD QUALITY GATE FAILED. Review the PMD report."
                     exit 1
                   fi
-                  echo "PMD QUALITY GATE PASSED. Continuing to Salesforce validation/deployment."
+
+                  echo "PMD QUALITY GATE PASSED."
+
+                  # Stop after PMD for the dummy PR target
+                  if [ "$IS_PR" = "true" ] && [ "$BASE_BRANCH" = "qabackup" ]; then
+                    echo "PMD validation completed for qabackup."
+                    echo "Skipping Salesforce authentication and deployment validation."
+                    circleci-agent step halt
+                  fi
 
       # -----------------------------------------------
       # 6. SELECT APEX TEST LEVEL FROM COMMIT MESSAGES
