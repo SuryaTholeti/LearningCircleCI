@@ -1,1237 +1,381 @@
 version: 2.1
 
+# ============================================================
+# Salesforce Delta Deployment Pipeline
+# Repo: acrisure-copado-digitald2c2-prod
+# ============================================================
+#
+# PREREQUISITES:
+#   - scripts/resolve-apex-tests.sh must exist in the repo root
+#   - CircleCI env vars: SF_QA_USERNAME, SF_QA_CLIENT_ID, SF_QA_INSTANCE_URL
+#                        SF_UAT_USERNAME, SF_UAT_CLIENT_ID, SF_UAT_INSTANCE_URL
+#                        SF_PROD_USERNAME, SF_PROD_CLIENT_ID, SF_PROD_INSTANCE_URL
+#                        JWT_KEY_QA, JWT_KEY_UAT, JWT_KEY_PROD
+#
+# ANNOTATION FORMAT — add to every non-test Apex class/trigger:
+#   /**
+#    * @tests: MyClassTest, AnotherTest
+#    */
+#
+# TEST RESOLUTION ORDER:
+#   1. @tests annotation in the class        → RunSpecifiedTests with those tests
+#   2. No annotation → <ClassName>Test exists → RunSpecifiedTests with that test
+#   3. No annotation → no convention match   → RunSpecifiedTests with default test
+#   4. No Apex in package (QA/UAT)           → NoTestRun
+#   5. No Apex in package (Prod/main)        → RunSpecifiedTests with default test
+#                                              (Salesforce production requires tests)
+#
+# PROD FLOW: validate-prod (dry run) → approve-prod (manual) → deploy-prod
+
 jobs:
   deploy:
     parameters:
-      environment:
-        type: enum
-        enum: ["auto", "dev", "qa", "uat", "prod"]
-      mode:
-        type: enum
-        enum: ["validate", "deploy"]
+      username:
+        type: env_var_name
+      client_id:
+        type: env_var_name
+      instance_url:
+        type: env_var_name
+      jwt_key:
+        type: env_var_name
+      test_level:
+        type: string
+        # Used on main branch only. QA/UAT test level is resolved dynamically.
+      dry_run:
+        type: boolean
+        default: false
+        # true = validate only (--dry-run), nothing saved to org
+
     docker:
       - image: cimg/node:22.17
-
-    working_directory: ~/project
 
     steps:
       - checkout
 
-      # -----------------------------------------------
-      # 1. INSTALL SALESFORCE CLI AND REQUIRED TOOLS
-      # -----------------------------------------------
-
       - run:
-          name: Install Salesforce CLI and Tools
+          name: Install Salesforce CLI
           command: |
-            set -euo pipefail
-
-            # Install Salesforce CLI
             sudo npm install -g @salesforce/cli@2.143.6
 
-            # Install Java and jq
-            sudo apt-get update -qq
-            sudo apt-get install -y openjdk-17-jdk jq
-
-            # Configure Java
-            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-            export PATH="$JAVA_HOME/bin:$PATH"
-
-            echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> "$BASH_ENV"
-            echo 'export PATH="$JAVA_HOME/bin:$PATH"' >> "$BASH_ENV"
-
-            # Configure trusted unsigned plugins
-            mkdir -p "$HOME/.config/sf"
-
-            printf '%s\n' \
-              '["sfdx-git-delta","@salesforce/plugin-code-analyzer"]' \
-              > "$HOME/.config/sf/unsignedPluginAllowList.json"
-
-            # Install required plugins
-            sf plugins install sfdx-git-delta
-            sf plugins install @salesforce/plugin-code-analyzer
-
-            # Verify installations
-            sf --version
-            sf plugins
-            java -version
-            sf code-analyzer --help
-
-      # -----------------------------------------------
-      #  2. IDENTIFY PR TARGET AND SALESFORCE ENVIRONMENT
-      # -----------------------------------------------
       - run:
-          name: Identify PR Target And Salesforce Environment
+          name: Create JWT Key
           command: |
-            set -euo pipefail
+            JWT_VAR="<< parameters.jwt_key >>"
+            printf '%s' "${!JWT_VAR}" | base64 --decode > circlecikey.key
+            chmod 600 circlecikey.key
 
-            MODE="<< parameters.mode >>"
-            ENVIRONMENT="<< parameters.environment >>"
-
-            # Safety guard: deployment is allowed only from its matching
-            # protected target branch. Feature-branch deployment is skipped.
-            if [ "$MODE" = "deploy" ]; then
-              case "${CIRCLE_BRANCH:-}:$ENVIRONMENT" in
-                dev:dev|qa:qa|uat:uat|main:prod)
-                  echo "Approved deployment branch: $CIRCLE_BRANCH"
-                  ;;
-                feature/*:*)
-                  echo "Feature branch detected ($CIRCLE_BRANCH). Skipping deployment job steps."
-                  circleci-agent step halt
-                  exit 0
-                  ;;
-                *)
-                  echo "ERROR: Deployment is not permitted from branch '${CIRCLE_BRANCH:-unknown}' to environment '$ENVIRONMENT'."
-                  exit 1
-                  ;;
-              esac
-            fi
-
-            IS_PR="false"
-            BASE_BRANCH=""
-
-            if [ "$MODE" = "validate" ] &&
-               [ "$ENVIRONMENT" = "auto" ]; then
-
-              if [ -z "${CIRCLE_PULL_REQUEST:-}" ]; then
-                echo "ERROR: A pull request URL is required for auto validation."
-                echo "Ensure CircleCI is configured to build pull requests."
-                exit 1
-              fi
-
-              
-              # Get the target branch directly from CircleCI GitHub App event
-              BASE_BRANCH="<< pipeline.event.github.pull_request.base.ref >>"
-
-              if [ -z "$BASE_BRANCH" ] || [ "$BASE_BRANCH" = "<nil>" ]; then
-                echo "ERROR: Unable to identify PR target branch."
-                exit 1
-              fi
-
-              echo "Pull Request target branch: $BASE_BRANCH"
-
-
-              case "$BASE_BRANCH" in
-                dev|qa|uat|main)
-                  IS_PR="true"
-                  ;;
-                *)
-                  echo "PR targets '${BASE_BRANCH}'."
-                  echo "Skipping validation for unsupported target branch."
-                  circleci-agent step halt
-                  exit 0
-                  ;;
-              esac
-
-              case "$BASE_BRANCH" in
-                dev) ENVIRONMENT="dev" ;;
-                qa) ENVIRONMENT="qa" ;;
-                uat) ENVIRONMENT="uat" ;;
-                main) ENVIRONMENT="prod" ;;
-              esac
-
-            else
-              case "$ENVIRONMENT" in
-                dev) BASE_BRANCH="dev" ;;
-                qa) BASE_BRANCH="qa" ;;
-                uat) BASE_BRANCH="uat" ;;
-                prod) BASE_BRANCH="main" ;;
-                *)
-                  echo "ERROR: Unsupported environment: $ENVIRONMENT"
-                  exit 1
-                  ;;
-              esac
-            fi
-
-            {
-              echo "export PIPELINE_MODE='${MODE}'"
-              echo "export TARGET_ENVIRONMENT='${ENVIRONMENT}'"
-              echo "export BASE_BRANCH='${BASE_BRANCH}'"
-              echo "export IS_PR='${IS_PR}'"
-            } >> "$BASH_ENV"
-
-            echo "Pipeline mode: ${MODE}"
-            echo "Target environment: ${ENVIRONMENT}"
-            echo "Base branch: ${BASE_BRANCH}"
-            echo "Pull request validation: ${IS_PR}"
-
-      # -----------------------------------------------
-      # 3. FETCH HISTORY AND GENERATE DELTA
-      # -----------------------------------------------
       - run:
-          name: Generate Salesforce Delta
+          name: Authenticate Salesforce
           command: |
-            set -euo pipefail
-
-            mkdir -p delta
-
-            # PR validation compares the PR head with its target branch.
-            # Post-merge push deployments compare the new target-branch commit
-            # with its first parent (works with merge-commit and squash merges).
-            git fetch origin --prune
-
-            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-              git fetch --unshallow origin
-            fi
-
-            if [ "$IS_PR" = "true" ]; then
-              git fetch origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
-              FROM_COMMIT=$(git merge-base HEAD "origin/${BASE_BRANCH}")
-            else
-              if ! git rev-parse HEAD^ >/dev/null 2>&1; then
-                echo "ERROR: Previous commit not found; cannot safely generate a delta."
-                exit 1
-              fi
-              FROM_COMMIT=$(git rev-parse HEAD^)
-            fi
-
-            echo "Comparing ${FROM_COMMIT} with HEAD ($(git rev-parse HEAD))"
-
-            sf sgd source delta \
-              --from "$FROM_COMMIT" \
-              --to HEAD \
-              --output-dir delta \
-              --source-dir force-app/main/default \
-              --generate-delta
-
-            echo "===== GENERATED PACKAGE.XML ====="
-            if [ -f delta/package/package.xml ]; then
-              cat delta/package/package.xml
-            else
-              echo "No package.xml generated."
-            fi
-
-            HAS_DELTA="false"
-            HAS_CHANGES="false"
-
-            if [ -f delta/package/package.xml ] && \
-               grep -q "<members>" delta/package/package.xml; then
-              HAS_DELTA="true"
-              HAS_CHANGES="true"
-            fi
-
-            for FILE in \
-              delta/destructiveChanges/destructiveChanges.xml \
-              delta/destructiveChanges/destructiveChangesPre.xml \
-              delta/destructiveChanges/destructiveChangesPost.xml \
-              delta/destructiveChanges/preDestructiveChanges.xml \
-              delta/destructiveChanges/postDestructiveChanges.xml
-            do
-              if [ -s "$FILE" ]; then
-                HAS_CHANGES="true"
-              fi
-            done
-
-            {
-              echo "export HAS_DELTA='${HAS_DELTA}'"
-              echo "export HAS_CHANGES='${HAS_CHANGES}'"
-              echo "export FROM_COMMIT='${FROM_COMMIT}'"
-            } >> "$BASH_ENV"
-
-            echo "HAS_DELTA=${HAS_DELTA}"
-            echo "HAS_CHANGES=${HAS_CHANGES}"
-
-      - when:
-          condition:
-            equal: [validate, << parameters.mode >>]
-          steps:
-            # -----------------------------------------------
-            # 4. PMD SCAN, REPORT AND QUALITY GATE
-            # -----------------------------------------------
-            - run:
-                name: PMD Scan, Severity Report and Quality Gate
-                command: |
-                  set -uo pipefail
-
-                  mkdir -p pmd-output
-                  rm -f pmd-output/pmd-report.json pmd-output/pmd-summary.html pmd-output/findings.json pmd-output/classified.json pmd-output/scanner.log
-
-                  DELTA_PATH="delta/force-app/main/default"
-                  FULL_PATH="force-app/main/default"
-                  SCAN_STATUS=0
-                  PARSE_STATUS=0
-
-                  # Select delta or full scan
-                  if [ -d "$DELTA_PATH" ] && find "$DELTA_PATH" -type f \( -name "*.cls" -o -name "*.trigger" -o -name "*.js" -o -name "*.html" -o -name "*.css" -o -name "*.cmp" -o -name "*.app" -o -name "*.evt" -o -name "*.intf" \) -print -quit | grep -q .; then
-                    TARGET_PATH="$DELTA_PATH"
-                    SCAN_MODE="Delta Scan"
-                  elif [ -d "$FULL_PATH" ]; then
-                    TARGET_PATH="$FULL_PATH"
-                    SCAN_MODE="Full Scan"
-                  else
-                    echo "ERROR: Salesforce source directory not found."
-                    exit 1
-                  fi
-
-                  echo "============================================"
-                  echo "Salesforce Code Analyzer - PMD"
-                  echo "Scan mode   : $SCAN_MODE"
-                  echo "Scan target : $TARGET_PATH"
-                  echo "============================================"
-
-                  # Run PMD using Salesforce Code Analyzer
-                  sf code-analyzer run --rule-selector pmd --workspace "$TARGET_PATH" --output-file pmd-output/pmd-report.json 2>&1 | tee pmd-output/scanner.log
-                  SCAN_STATUS=${PIPESTATUS[0]}
-                  echo "Scanner exit code: $SCAN_STATUS"
-
-                  # Validate scanner JSON
-                  if [ ! -s pmd-output/pmd-report.json ]; then
-                    echo "ERROR: Scanner did not generate a JSON report."
-                    PARSE_STATUS=1
-                    printf '{"violations":[]}\n' > pmd-output/pmd-report.json
-                  elif ! jq -e . pmd-output/pmd-report.json >/dev/null 2>&1; then
-                    echo "ERROR: Scanner report is invalid JSON."
-                    PARSE_STATUS=1
-                    printf '{"violations":[]}\n' > pmd-output/pmd-report.json
-                  fi
-
-                  # Normalize Code Analyzer findings
-                  if [ "$PARSE_STATUS" -eq 0 ]; then
-                    if ! jq 'if type == "array" then [.[] | if type == "object" and (.violations | type == "array") then .violations[] else . end] elif type == "object" and (.violations | type == "array") then .violations else error("Unrecognized report structure") end | map(select(type == "object"))' pmd-output/pmd-report.json > pmd-output/findings.json; then
-                      echo "ERROR: Unable to parse scanner findings."
-                      PARSE_STATUS=1
-                      printf '[]\n' > pmd-output/findings.json
-                    fi
-                  else
-                    printf '[]\n' > pmd-output/findings.json
-                  fi
-
-                  # Classify PMD severity in a single-line jq expression
-                  if [ "$PARSE_STATUS" -eq 0 ]; then
-                    if ! jq 'map(. as $v | (($v.severity // $v.priority // $v.ruleSeverity // "unknown") | tostring | ascii_downcase) as $s | $v + {pipelineSeverity: (if ($s == "1" or $s == "2" or $s == "high" or $s == "critical" or $s == "error") then "High" elif ($s == "3" or $s == "medium" or $s == "moderate" or $s == "warning") then "Medium" elif ($s == "4" or $s == "5" or $s == "low" or $s == "info" or $s == "informational") then "Low" else "Unknown" end)})' pmd-output/findings.json > pmd-output/classified.json; then
-                      echo "ERROR: Severity classification failed."
-                      PARSE_STATUS=1
-                      printf '[]\n' > pmd-output/classified.json
-                    fi
-                  else
-                    printf '[]\n' > pmd-output/classified.json
-                  fi
-
-                  # Count findings
-                  HIGH_COUNT=$(jq '[.[] | select(.pipelineSeverity == "High")] | length' pmd-output/classified.json)
-                  MEDIUM_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Medium")] | length' pmd-output/classified.json)
-                  LOW_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Low")] | length' pmd-output/classified.json)
-                  UNKNOWN_COUNT=$(jq '[.[] | select(.pipelineSeverity == "Unknown")] | length' pmd-output/classified.json)
-                  TOTAL_COUNT=$(jq 'length' pmd-output/classified.json)
-
-                  # Color-coded console summary
-                  RED='\033[0;31m'
-                  YELLOW='\033[0;33m'
-                  GREEN='\033[0;32m'
-                  RESET='\033[0m'
-
-                  echo ""
-                  echo "============================================"
-                  echo "             PMD SUMMARY"
-                  echo "============================================"
-                  printf "Scan mode        : %s\n" "$SCAN_MODE"
-                  printf "High severity    : ${RED}%s${RESET}\n" "$HIGH_COUNT"
-                  printf "Medium severity  : ${YELLOW}%s${RESET}\n" "$MEDIUM_COUNT"
-                  printf "Low severity     : ${GREEN}%s${RESET}\n" "$LOW_COUNT"
-                  printf "Unknown severity : %s\n" "$UNKNOWN_COUNT"
-                  printf "Total findings   : %s\n" "$TOTAL_COUNT"
-                  echo "============================================"
-
-                  # HTML escaping helper
-                  html_escape() {
-                    printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
-                  }
-
-                  # Generate a downloadable HTML dashboard with colored KPI cards and severity chart.
-                  TOTAL_SAFE=$((TOTAL_COUNT > 0 ? TOTAL_COUNT : 1))
-                  HIGH_WIDTH=$(awk -v n="$HIGH_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
-                  MEDIUM_WIDTH=$(awk -v n="$MEDIUM_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
-                  LOW_WIDTH=$(awk -v n="$LOW_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
-                  UNKNOWN_WIDTH=$(awk -v n="$UNKNOWN_COUNT" -v t="$TOTAL_SAFE" 'BEGIN { printf "%.2f", (n/t)*100 }')
-
-                  if [ "$SCAN_STATUS" -ne 0 ] || [ "$PARSE_STATUS" -ne 0 ]; then
-                    GATE_LABEL="SCAN ERROR"
-                    GATE_CLASS="status-error"
-                  elif [ "$HIGH_COUNT" -gt 0 ]; then
-                    GATE_LABEL="FAILED - HIGH SEVERITY FINDINGS"
-                    GATE_CLASS="status-failed"
-                  else
-                    GATE_LABEL="PASSED - NO HIGH SEVERITY FINDINGS"
-                    GATE_CLASS="status-passed"
-                  fi
-
-                  {
-                    cat \<<HTML
-                  <!doctype html>
-                  <html lang="en">
-                  <head>
-                    <meta charset="utf-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1">
-                    <title>Salesforce PMD Quality Dashboard</title>
-                    <style>
-                      *{box-sizing:border-box}
-                      body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#f4f6fa;color:#202938}
-                      .container{max-width:1280px;margin:0 auto;padding:28px}
-                      .header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}
-                      h1{margin:0 0 8px;font-size:28px}
-                      .muted{color:#64748b;font-size:13px;line-height:1.6}
-                      .status{padding:10px 14px;border-radius:8px;font-size:12px;font-weight:800;letter-spacing:.3px}
-                      .status-passed{background:#dcfce7;color:#166534;border:1px solid #86efac}
-                      .status-failed,.status-error{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
-                      .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:26px 0}
-                      .card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;box-shadow:0 2px 8px rgba(15,23,42,.04)}
-                      .card-label{font-size:12px;text-transform:uppercase;letter-spacing:.7px;font-weight:700;color:#64748b}
-                      .card-value{font-size:34px;font-weight:800;margin-top:9px}
-                      .card.high{border-top:5px solid #dc2626}.card.medium{border-top:5px solid #f59e0b}.card.low{border-top:5px solid #16a34a}.card.unknown{border-top:5px solid #64748b}.card.total{border-top:5px solid #2563eb}
-                      .high .card-value{color:#b91c1c}.medium .card-value{color:#b45309}.low .card-value{color:#15803d}.unknown .card-value{color:#475569}.total .card-value{color:#1d4ed8}
-                      .panel{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin:18px 0;box-shadow:0 2px 8px rgba(15,23,42,.04)}
-                      h2{font-size:18px;margin:0 0 18px}
-                      .bar-row{display:grid;grid-template-columns:100px 1fr 55px;gap:12px;align-items:center;margin:14px 0;font-size:13px}
-                      .track{height:14px;background:#edf2f7;border-radius:99px;overflow:hidden}
-                      .fill{height:100%;border-radius:99px;min-width:0}
-                      .fill.high{background:#dc2626}.fill.medium{background:#f59e0b}.fill.low{background:#16a34a}.fill.unknown{background:#64748b}
-                      .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;font-size:13px}
-                      .meta div{padding:10px;background:#f8fafc;border-radius:8px;overflow-wrap:anywhere}
-                      .table-wrap{overflow-x:auto}
-                      table{border-collapse:collapse;width:100%;min-width:900px;font-size:13px}
-                      th,td{border-bottom:1px solid #e2e8f0;padding:11px 10px;text-align:left;vertical-align:top}
-                      th{background:#f8fafc;color:#475569;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-                      .pill{display:inline-block;padding:4px 8px;border-radius:99px;font-weight:800;font-size:11px}
-                      .pill-high{background:#fee2e2;color:#991b1b}.pill-medium{background:#fef3c7;color:#92400e}.pill-low{background:#dcfce7;color:#166534}.pill-unknown{background:#e2e8f0;color:#334155}
-                      code{overflow-wrap:anywhere}
-                      a{color:#1d4ed8}
-                      .footer{color:#64748b;font-size:12px;margin:22px 0}
-                      @media(max-width:600px){.container{padding:16px}.bar-row{grid-template-columns:78px 1fr 38px;gap:8px}.card-value{font-size:28px}}
-                    </style>
-                  </head>
-                  <body>
-                    <main class="container">
-                      <section class="header">
-                        <div>
-                          <h1>Salesforce PMD Quality Dashboard</h1>
-                          <div class="muted">Generated by Salesforce Code Analyzer in CircleCI</div>
-                        </div>
-                        <div class="status ${GATE_CLASS}">${GATE_LABEL}</div>
-                      </section>
-                      <section class="grid">
-                        <div class="card total"><div class="card-label">Total findings</div><div class="card-value">${TOTAL_COUNT}</div></div>
-                        <div class="card high"><div class="card-label">High severity</div><div class="card-value">${HIGH_COUNT}</div></div>
-                        <div class="card medium"><div class="card-label">Medium severity</div><div class="card-value">${MEDIUM_COUNT}</div></div>
-                        <div class="card low"><div class="card-label">Low severity</div><div class="card-value">${LOW_COUNT}</div></div>
-                        <div class="card unknown"><div class="card-label">Unknown severity</div><div class="card-value">${UNKNOWN_COUNT}</div></div>
-                      </section>
-                      <section class="panel">
-                        <h2>Severity distribution</h2>
-                        <div class="bar-row"><strong>High</strong><div class="track"><div class="fill high" style="width:${HIGH_WIDTH}%"></div></div><strong>${HIGH_COUNT}</strong></div>
-                        <div class="bar-row"><strong>Medium</strong><div class="track"><div class="fill medium" style="width:${MEDIUM_WIDTH}%"></div></div><strong>${MEDIUM_COUNT}</strong></div>
-                        <div class="bar-row"><strong>Low</strong><div class="track"><div class="fill low" style="width:${LOW_WIDTH}%"></div></div><strong>${LOW_COUNT}</strong></div>
-                        <div class="bar-row"><strong>Unknown</strong><div class="track"><div class="fill unknown" style="width:${UNKNOWN_WIDTH}%"></div></div><strong>${UNKNOWN_COUNT}</strong></div>
-                      </section>
-                      <section class="panel">
-                        <h2>Scan details</h2>
-                        <div class="meta">
-                          <div><strong>Scan mode:</strong> ${SCAN_MODE}</div>
-                          <div><strong>Scan target:</strong> ${TARGET_PATH}</div>
-                          <div><strong>Scanner exit code:</strong> ${SCAN_STATUS}</div>
-                          <div><strong>Report parsing status:</strong> ${PARSE_STATUS}</div>
-                          <div><strong>Quality gate:</strong> ${GATE_LABEL}</div>
-                        </div>
-                      </section>
-                      <section class="panel">
-                        <h2>Detailed findings</h2>
-                        <div class="table-wrap">
-                          <table>
-                            <thead><tr><th>Severity</th><th>Rule</th><th>Message</th><th>Apex class / file</th><th>Line</th><th>Column</th><th>Documentation</th></tr></thead>
-                            <tbody>
-                  HTML
-                  } > pmd-output/pmd-dashboard.html
-
-                  # Keep the detailed report filename as a compatibility copy of the dashboard.
-                  cp pmd-output/pmd-dashboard.html pmd-output/pmd-summary.html
-
-                  # Read each normalized finding
-                  while IFS= read -r FINDING; do
-                    SEVERITY=$(printf '%s' "$FINDING" | jq -r '.pipelineSeverity // "Unknown"')
-                    RULE=$(printf '%s' "$FINDING" | jq -r '.rule // .ruleName // .ruleId // "Unknown"')
-                    MESSAGE=$(printf '%s' "$FINDING" | jq -r '.message // .description // ""')
-
-                    # Actual Code Analyzer location structure: locations[].file/startLine/startColumn
-                    FILE=$(printf '%s' "$FINDING" | jq -r '.locations[0].file // .fileName // .file // .uri // .sourcePath // "Location unavailable"')
-                    LINE=$(printf '%s' "$FINDING" | jq -r '.locations[0].startLine // .line // .lineNumber // .startLine // "N/A"')
-                    COLUMN=$(printf '%s' "$FINDING" | jq -r '.locations[0].startColumn // .column // .columnNumber // .startColumn // "N/A"')
-
-                    FILE_NAME="${FILE##*/}"
-                    if [ "$FILE" != "Location unavailable" ] && [ -n "$FILE_NAME" ]; then
-                      APEX_CLASS="${FILE_NAME%.cls}"
-                    else
-                      APEX_CLASS="Location unavailable"
-                      FILE_NAME="Location unavailable"
-                    fi
-
-                    RULE=$(html_escape "$RULE")
-                    MESSAGE=$(html_escape "$MESSAGE")
-                    FILE_NAME=$(html_escape "$FILE_NAME")
-                    APEX_CLASS=$(html_escape "$APEX_CLASS")
-
-                    case "$SEVERITY" in
-                      High) CSS_CLASS="pill-high" ;;
-                      Medium) CSS_CLASS="pill-medium" ;;
-                      Low) CSS_CLASS="pill-low" ;;
-                      *) CSS_CLASS="pill-unknown" ;;
-                    esac
-
-                    # Prefer the direct documentation URL included in the finding.
-                    DOC_URL=$(printf '%s' "$FINDING" | jq -r '.resources[0] // .url // ""')
-                    if [ -z "$DOC_URL" ]; then
-                      case "$RULE" in
-                        ApexCRUDViolation) DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_security.html#apexcrudviolation" ;;
-                        ApexUnitTestClassShouldHaveRunAs) DOC_URL="https://docs.pmd-code.org/latest/pmd_rules_apex_bestpractices.html#apexunittestclassshouldhaverunas" ;;
-                        *) DOC_URL="https://docs.pmd-code.org/latest/" ;;
-                      esac
-                    fi
-
-                    printf '<tr><td><span class="pill %s">%s</span></td><td>%s</td><td>%s</td><td><strong>%s</strong><br><small><code>%s</code></small></td><td>%s</td><td>%s</td><td><a href="%s" target="_blank" rel="noopener noreferrer">View documentation</a></td></tr>\n' \
-                      "$CSS_CLASS" "$SEVERITY" "$RULE" "$MESSAGE" "$APEX_CLASS" "$FILE_NAME" "$LINE" "$COLUMN" "$DOC_URL" \
-                      >> pmd-output/pmd-dashboard.html
-
-                  done < <(jq -c '.[]' pmd-output/classified.json)
-
-                  {
-                    echo '</tbody></table>'
-                    echo '</div>'
-                    echo '<p class="footer">Generated by Salesforce Code Analyzer in CircleCI. High severity findings block the pipeline; Medium, Low and Unknown severity findings are reported but do not block deployment.</p>'
-                    echo '</section>'
-                    echo '</main></body></html>'
-                  } >> pmd-output/pmd-dashboard.html
-
-                  cp pmd-output/pmd-dashboard.html pmd-output/pmd-summary.html
-
-                  # Save useful diagnostic details
-                  if grep -q 'Location unavailable' pmd-output/pmd-summary.html; then
-                    echo "WARNING: Some findings have no recognized source path."
-                    echo "First normalized finding:"
-                    jq '.[0]' pmd-output/findings.json || true
-                  fi
-
-                  # Combined quality gate
-                  echo ""
-                  echo "============================================"
-                  echo "             PMD QUALITY GATE"
-                  echo "============================================"
-
-                  # Only High severity findings block the pipeline.
-                  # Medium, Low and Unknown findings remain visible in the dashboard.
-                  if [ "$SCAN_STATUS" -ne 0 ] || [ "$PARSE_STATUS" -ne 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
-                    PMD_GATE_FAILED="true"
-                    if [ "$SCAN_STATUS" -ne 0 ]; then
-                      echo "FAILED: Code Analyzer returned an error."
-                    elif [ "$PARSE_STATUS" -ne 0 ]; then
-                      echo "FAILED: PMD report could not be parsed."
-                    else
-                      echo "FAILED: High-severity findings detected."
-                    fi
-                  else
-                    PMD_GATE_FAILED="false"
-                    echo "PASSED: No High-severity findings detected."
-                    echo "Medium, Low and Unknown severity findings do not block the pipeline."
-                  fi
-
-                  {
-                    echo "export PMD_SCAN_STATUS='${SCAN_STATUS}'"
-                    echo "export PMD_PARSE_STATUS='${PARSE_STATUS}'"
-                    echo "export PMD_HIGH_COUNT='${HIGH_COUNT}'"
-                    echo "export PMD_MEDIUM_COUNT='${MEDIUM_COUNT}'"
-                    echo "export PMD_LOW_COUNT='${LOW_COUNT}'"
-                    echo "export PMD_UNKNOWN_COUNT='${UNKNOWN_COUNT}'"
-                    echo "export PMD_GATE_FAILED='${PMD_GATE_FAILED}'"
-                  } >> "$BASH_ENV"
-
-                  # Do not fail this step yet. Upload the dashboard first.
-                  exit 0
-
-            # -----------------------------------------------
-            # 5. Publish PMD dashboard and raw reports.
-            # This runs before the quality-gate enforcement step,
-            # so the report is available even when High findings exist.
-            # -----------------------------------------------
-            - store_artifacts:
-                path: pmd-output
-                destination: salesforce-pmd-report
-
-            - run:
-                name: Enforce PMD Quality Gate
-                command: |
-                  set -euo pipefail
-                  if [ "${PMD_GATE_FAILED:-true}" = "true" ]; then
-                    echo "PMD QUALITY GATE FAILED. Review the downloadable pmd-dashboard.html artifact."
-                    exit 1
-                  fi
-                  echo "PMD QUALITY GATE PASSED. Continuing to Salesforce validation/deployment."
-
-      # -----------------------------------------------
-      # 6. SELECT APEX TEST LEVEL FROM COMMIT MESSAGES
-      # -----------------------------------------------
-      - run:
-          name: Select Apex Tests From Commit Message
-          command: |
-            set -euo pipefail
-
-            # -----------------------------------------------
-            # 1. SET DEFAULT TEST LEVEL BASED ON ENVIRONMENT
-            # -----------------------------------------------
-
-            case "$TARGET_ENVIRONMENT" in
-              dev) DEFAULT_TEST_LEVEL="NoTestRun" ;;
-              qa|uat|prod) DEFAULT_TEST_LEVEL="RunLocalTests" ;;
-              *) echo "ERROR: Unsupported environment: $TARGET_ENVIRONMENT"; exit 1 ;;
-            esac
-
-            # -----------------------------------------------
-            # 2. VERIFY COMMIT RANGE
-            # -----------------------------------------------
-
-            if [ -z "${FROM_COMMIT:-}" ]; then
-              echo "ERROR: FROM_COMMIT is not available for test selection."
-              exit 1
-            fi
-
-            echo "============================================"
-            echo "APEX TEST SELECTION"
-            echo "============================================"
-            echo "Target environment: $TARGET_ENVIRONMENT"
-            echo "From commit: $FROM_COMMIT"
-            echo "Current commit: $(git rev-parse HEAD)"
-
-            # -----------------------------------------------
-            # 3. COLLECT TEST DIRECTIVES FROM ALL COMMITS
-            # -----------------------------------------------
-
-            mapfile -t TEST_TOKENS < <(
-              git log --format=%B "${FROM_COMMIT}..HEAD" |
-              grep -oE '\[TEST=[^]]+\]' || true
-            )
-
-            echo "Detected test directives:"
-            printf '%s\n' "${TEST_TOKENS[@]}"
-
-            # -----------------------------------------------
-            # 4. PROCESS TEST DIRECTIVES
-            # -----------------------------------------------
-
-            SELECTED_MODE=""
-            declare -A SELECTED_CLASSES=()
-
-            for TOKEN in "${TEST_TOKENS[@]}"; do
-
-              echo "--------------------------------------------"
-              echo "Processing token: $TOKEN"
-
-              VALUE="${TOKEN#\[TEST=}"
-              VALUE="${VALUE%\]}"
-              VALUE="$(printf '%s' "$VALUE" | tr -d '[:space:]')"
-
-              echo "Extracted value: $VALUE"
-              echo "Current selected mode: ${SELECTED_MODE:-none}"
-
-              case "${VALUE^^}" in
-
-                NONE|SKIP)
-
-                  # Ignore NONE/SKIP directives only for production.
-                  if [ "$TARGET_ENVIRONMENT" = "prod" ]; then
-                    echo "WARNING: Ignoring $TOKEN for production."
-                    continue
-                  fi
-
-                  if [ -n "$SELECTED_MODE" ] && [ "$SELECTED_MODE" != "NoTestRun" ]; then
-                    echo "ERROR: Conflicting [TEST=...] directives found in commits."
-                    exit 1
-                  fi
-
-                  SELECTED_MODE="NoTestRun"
-                  ;;
-
-                ALL)
-
-                  if [ -n "$SELECTED_MODE" ] && [ "$SELECTED_MODE" != "RunLocalTests" ]; then
-                    echo "ERROR: Conflicting [TEST=...] directives found in commits."
-                    exit 1
-                  fi
-
-                  SELECTED_MODE="RunLocalTests"
-                  ;;
-
-                *)
-
-                  # Validate specified Apex test class names.
-                  if ! [[ "$VALUE" =~ ^[A-Za-z_][A-Za-z0-9_]*(,[A-Za-z_][A-Za-z0-9_]*)*$ ]]; then
-                    echo "ERROR: Invalid test directive: $TOKEN"
-                    echo "Use [TEST=NONE], [TEST=SKIP], [TEST=ALL], or [TEST=ClassA,ClassB]."
-                    exit 1
-                  fi
-
-                  if [ -n "$SELECTED_MODE" ] && [ "$SELECTED_MODE" != "RunSpecifiedTests" ]; then
-                    echo "ERROR: Conflicting [TEST=...] directives found in commits."
-                    exit 1
-                  fi
-
-                  SELECTED_MODE="RunSpecifiedTests"
-
-                  # Collect and deduplicate all specified test classes.
-                  IFS=',' read -r -a CLASS_NAMES < <(printf '%s\n' "$VALUE")
-
-                  for CLASS_NAME in "${CLASS_NAMES[@]}"; do
-                    SELECTED_CLASSES["$CLASS_NAME"]=1
-                  done
-                  ;;
-
-              esac
-              
-              echo "Selected mode after processing: ${SELECTED_MODE:-none}"
-              echo "Collected classes: ${!SELECTED_CLASSES[*]}"
-
-            done
-
-            # -----------------------------------------------
-            # 5. DETERMINE FINAL TEST LEVEL
-            # -----------------------------------------------
-
-            TEST_LEVEL="${SELECTED_MODE:-$DEFAULT_TEST_LEVEL}"
-            TEST_CLASSES_CSV=""
-
-            if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
-
-              TEST_CLASSES_CSV="$(
-                printf '%s\n' "${!SELECTED_CLASSES[@]}" | sort | paste -sd, -
-              )"
-
-              if [ -z "$TEST_CLASSES_CSV" ]; then
-                echo "ERROR: RunSpecifiedTests selected without any test classes."
-                exit 1
-              fi
-
-            fi
-
-            # -----------------------------------------------
-            # 6. PRODUCTION SAFETY CHECK
-            # -----------------------------------------------
-
-            if [ "$TARGET_ENVIRONMENT" = "prod" ] && [ "$TEST_LEVEL" = "NoTestRun" ]; then
-              echo "ERROR: NoTestRun is not permitted for production deployments."
-              exit 1
-            fi
-
-            # -----------------------------------------------
-            # 7. EXPORT VARIABLES FOR NEXT CIRCLECI STEPS
-            # -----------------------------------------------
-
-            {
-              echo "export TEST_LEVEL='${TEST_LEVEL}'"
-              echo "export TEST_CLASSES_CSV='${TEST_CLASSES_CSV}'"
-            } >> "$BASH_ENV"
-
-            # -----------------------------------------------
-            # 8. DISPLAY FINAL TEST SELECTION
-            # -----------------------------------------------
-
-            echo "============================================"
-            echo "FINAL APEX TEST SELECTION"
-            echo "============================================"
-
-            echo "Target environment: $TARGET_ENVIRONMENT"
-            echo "Selected Apex test level: $TEST_LEVEL"
-
-            if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
-              echo "Selected Apex test classes: $TEST_CLASSES_CSV"
-            fi
-
-            if [ "${#TEST_TOKENS[@]}" -eq 0 ]; then
-              echo "No commit test directive found; using environment default."
-            else
-              echo "Processed commit directives:"
-              printf '%s\n' "${TEST_TOKENS[@]}"
-            fi
-
-            echo "============================================"
-
-      # -----------------------------------------------
-      # 7. AUTHENTICATE TO THE TARGET ORG
-      # -----------------------------------------------
-      - run:
-          name: Authenticate Salesforce with JWT
-          command: |
-            set -euo pipefail
-
-            case "$TARGET_ENVIRONMENT" in
-              dev) USERNAME_ENV="SF_DEV_USERNAME"; CLIENT_ID_ENV="SF_DEV_CLIENT_ID"; INSTANCE_URL_ENV="SF_DEV_INSTANCE_URL"; JWT_ENV="JWT_KEY_DEV" ;;
-              qa) USERNAME_ENV="SF_QA_USERNAME"; CLIENT_ID_ENV="SF_QA_CLIENT_ID"; INSTANCE_URL_ENV="SF_QA_INSTANCE_URL"; JWT_ENV="JWT_KEY_QA" ;;
-              uat) USERNAME_ENV="SF_UAT_USERNAME"; CLIENT_ID_ENV="SF_UAT_CLIENT_ID"; INSTANCE_URL_ENV="SF_UAT_INSTANCE_URL"; JWT_ENV="JWT_KEY_UAT" ;;
-              prod) USERNAME_ENV="SF_PROD_USERNAME"; CLIENT_ID_ENV="SF_PROD_CLIENT_ID"; INSTANCE_URL_ENV="SF_PROD_INSTANCE_URL"; JWT_ENV="JWT_KEY_PROD" ;;
-              *) echo "ERROR: Unsupported target environment."; exit 1 ;;
-            esac
-
-            USERNAME="${!USERNAME_ENV:-}"
-            CLIENT_ID="${!CLIENT_ID_ENV:-}"
-            INSTANCE_URL="${!INSTANCE_URL_ENV:-}"
-            JWT_B64="${!JWT_ENV:-}"
-
-            if [ -z "$USERNAME" ] ||
-               [ -z "$CLIENT_ID" ] ||
-               [ -z "$INSTANCE_URL" ] ||
-               [ -z "$JWT_B64" ]; then
-              echo "ERROR: One or more Salesforce environment variables are missing."
-              exit 1
-            fi
-
-            KEY_FILE="$PWD/circleci.key"
-
-            printf '%s' "$JWT_B64" | base64 --decode > "$KEY_FILE"
-            chmod 600 "$KEY_FILE"
-
-            ORGALIAS="targetorg"
-
-            echo "============================================"
-            echo "SALESFORCE JWT AUTHENTICATION"
-            echo "============================================"
-            echo "Authenticating Salesforce user: $USERNAME"
-            echo "Target instance URL: $INSTANCE_URL"
+            USERNAME_VAR="<< parameters.username >>"
+            CLIENT_ID_VAR="<< parameters.client_id >>"
+            INSTANCE_URL_VAR="<< parameters.instance_url >>"
 
             sf org login jwt \
-              --client-id "$CLIENT_ID" \
-              --jwt-key-file "$KEY_FILE" \
-              --username "$USERNAME" \
-              --instance-url "$INSTANCE_URL" \
-              --alias "$ORGALIAS"
+              --client-id "${!CLIENT_ID_VAR}" \
+              --jwt-key-file circlecikey.key \
+              --username "${!USERNAME_VAR}" \
+              --instance-url "${!INSTANCE_URL_VAR}" \
+              --alias targetorg
 
-            echo ""
-            echo "JWT authentication successful."
-            echo "Authenticated Org Alias: $ORGALIAS"
-            echo "Verifying authenticated Salesforce org..."
-
-            sf org display --target-org "$ORGALIAS" || {
-              echo "ERROR: Salesforce org authentication verification failed."
-              exit 1
-            }
-
-            echo "Salesforce authentication verification completed."
-            rm -f "$KEY_FILE"
-
-      # -----------------------------------------------
-      # 8. SALESFORCE DRY-RUN VALIDATION
-      # -----------------------------------------------
       - run:
-          name: Salesforce Dry-Run Validation
+          name: Install Delta Plugin
           command: |
-            set -euo pipefail
+            yes | sf plugins install sfdx-git-delta@latest || true
 
-            if [ "$PIPELINE_MODE" != "validate" ]; then
-              echo "Skipping validation. Mode: $PIPELINE_MODE"
-              exit 0
-            fi
-
-            PKG_FILE="delta/package/package.xml"
-            PRE_XML=""
-            POST_XML=""
-            DEPLOY_ARGS=()
-
-            echo "============================================"
-            echo "SALESFORCE DRY-RUN VALIDATION"
-            echo "============================================"
-
-            echo "Environment : $TARGET_ENVIRONMENT"
-            echo "Mode        : $PIPELINE_MODE"
-
-            # TEST_LEVEL and TEST_CLASSES_CSV are selected once in the
-            # preceding step and reused for validation and actual deployment.
-            echo "Apex test level: $TEST_LEVEL"
-            echo "Apex test classes: ${TEST_CLASSES_CSV:-none}"
-
-            # ---------------------------------------
-            # Detect pre-destructive changes
-            # ---------------------------------------
-            for FILE in \
-              delta/destructiveChanges/preDestructiveChanges.xml \
-              delta/destructiveChanges/destructiveChangesPre.xml
-            do
-              if [ -s "$FILE" ]; then
-                PRE_XML="$FILE"
-                break
-              fi
-            done
-
-            # ---------------------------------------
-            # Detect post-destructive changes
-            # ---------------------------------------
-            for FILE in \
-              delta/destructiveChanges/postDestructiveChanges.xml \
-              delta/destructiveChanges/destructiveChangesPost.xml \
-              delta/destructiveChanges/destructiveChanges.xml
-            do
-              if [ -s "$FILE" ]; then
-                POST_XML="$FILE"
-                break
-              fi
-            done
-
-            # ---------------------------------------
-            # Check whether destructive changes exist
-            # ---------------------------------------
-            HAS_PRE_DESTRUCTIVE="false"
-            HAS_POST_DESTRUCTIVE="false"
-
-            if [ -n "$PRE_XML" ]; then
-              HAS_PRE_DESTRUCTIVE="true"
-            fi
-
-            if [ -n "$POST_XML" ]; then
-              HAS_POST_DESTRUCTIVE="true"
-            fi
-
-            # ---------------------------------------
-            # Prepare deployment arguments
-            # ---------------------------------------
-
-            if [ "$HAS_PRE_DESTRUCTIVE" = "true" ] || \
-               [ "$HAS_POST_DESTRUCTIVE" = "true" ]; then
-
-              echo "Destructive changes detected."
-
-              if [ ! -s "$PKG_FILE" ]; then
-                echo "ERROR: Destructive changes require a valid package.xml."
-                exit 1
-              fi
-
-              DEPLOY_ARGS=(--manifest "$PKG_FILE")
-
-            elif [ -f "$PKG_FILE" ] && \
-                 grep -Eq '<members>[^<]+</members>' "$PKG_FILE"; then
-
-              echo "Using generated delta package.xml."
-
-              DEPLOY_ARGS=(--manifest "$PKG_FILE")
-
-            elif [ -d "delta/force-app/main/default" ] && \
-                 find delta/force-app/main/default -type f -print -quit | grep -q .; then
-
-              echo "Using generated delta source directory."
-
-              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
-
-            else
-
-              echo "No deployable Salesforce metadata changes found."
-              echo "Skipping dry-run validation successfully."
-              exit 0
-
-            fi
-
-            # ---------------------------------------
-            # Add destructive change arguments
-            # ---------------------------------------
-
-            if [ -n "$PRE_XML" ]; then
-              DEPLOY_ARGS+=(--pre-destructive-changes "$PRE_XML")
-              echo "Pre-destructive changes: $PRE_XML"
-            fi
-
-            if [ -n "$POST_XML" ]; then
-              DEPLOY_ARGS+=(--post-destructive-changes "$POST_XML")
-              echo "Post-destructive changes: $POST_XML"
-            fi
-
-            # ---------------------------------------
-            # Execute Salesforce dry-run validation
-            # ---------------------------------------
-
-            echo "Starting Salesforce dry-run validation..."
-
-            if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
-              IFS=',' read -r -a TEST_CLASSES < <(printf '%s\n' "$TEST_CLASSES_CSV")
-              sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level RunSpecifiedTests --tests "${TEST_CLASSES[@]}" --dry-run --wait 800 --ignore-warnings --verbose
-            else
-              sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level "$TEST_LEVEL" --dry-run --wait 800 --ignore-warnings --verbose
-            fi
-
-            echo "============================================"
-            echo "SUCCESS: Salesforce dry-run validation completed."
-            echo "============================================"
-
-      # -----------------------------------------------
-      # 9. SALESFORCE ACTUAL DEPLOYMENT
-      # -----------------------------------------------
       - run:
-          name: Salesforce Actual Deployment
+          name: Fetch Git History
           command: |
-            set -euo pipefail
+            git fetch --all --prune
+            git fetch --unshallow || true
 
-            if [ "$PIPELINE_MODE" != "deploy" ]; then
-              echo "Skipping deployment. Mode: $PIPELINE_MODE"
-              exit 0
-            fi
-
-            # Final deployment safety check. Never deploy from feature branches
-            # or deploy to an environment that does not match the branch.
-            case "${CIRCLE_BRANCH:-}:$TARGET_ENVIRONMENT" in
-              dev:dev|qa:qa|uat:uat|main:prod)
-                echo "Deployment branch/environment check passed."
-                ;;
-              feature/*:*)
-                echo "Feature branch detected ($CIRCLE_BRANCH). Skipping Salesforce deployment."
-                circleci-agent step halt
-                exit 0
-                ;;
-              *)
-                echo "ERROR: Branch '${CIRCLE_BRANCH:-unknown}' cannot deploy to '$TARGET_ENVIRONMENT'."
-                exit 1
-                ;;
-            esac
-
-            PKG_FILE="delta/package/package.xml"
-            PRE_XML=""
-            POST_XML=""
-            DEPLOY_ARGS=()
-
-            echo "============================================"
-            echo "SALESFORCE ACTUAL DEPLOYMENT"
-            echo "============================================"
-
-            echo "Environment : $TARGET_ENVIRONMENT"
-            echo "Mode        : $PIPELINE_MODE"
-
-            # Reuse the exact test selection used by dry-run validation.
-            echo "Selected Apex test level: $TEST_LEVEL"
-            echo "Selected Apex test classes: ${TEST_CLASSES_CSV:-none}"
-
-            # ---------------------------------------
-            # Detect pre-destructive changes
-            # ---------------------------------------
-            for FILE in \
-              delta/destructiveChanges/preDestructiveChanges.xml \
-              delta/destructiveChanges/destructiveChangesPre.xml
-            do
-              if [ -s "$FILE" ]; then
-                PRE_XML="$FILE"
-                break
-              fi
-            done
-
-            # ---------------------------------------
-            # Detect post-destructive changes
-            # ---------------------------------------
-            for FILE in \
-              delta/destructiveChanges/postDestructiveChanges.xml \
-              delta/destructiveChanges/destructiveChangesPost.xml \
-              delta/destructiveChanges/destructiveChanges.xml
-            do
-              if [ -s "$FILE" ]; then
-                POST_XML="$FILE"
-                break
-              fi
-            done
-
-            # ---------------------------------------
-            # Check whether destructive changes exist
-            # ---------------------------------------
-            HAS_PRE_DESTRUCTIVE="false"
-            HAS_POST_DESTRUCTIVE="false"
-
-            if [ -n "$PRE_XML" ]; then
-              HAS_PRE_DESTRUCTIVE="true"
-            fi
-
-            if [ -n "$POST_XML" ]; then
-              HAS_POST_DESTRUCTIVE="true"
-            fi
-
-            # ---------------------------------------
-            # Prepare deployment arguments
-            # ---------------------------------------
-
-            if [ "$HAS_PRE_DESTRUCTIVE" = "true" ] || \
-               [ "$HAS_POST_DESTRUCTIVE" = "true" ]; then
-
-              echo "Destructive changes detected."
-
-              if [ ! -s "$PKG_FILE" ]; then
-                echo "ERROR: Destructive changes require a valid package.xml."
-                exit 1
-              fi
-
-              DEPLOY_ARGS=(--manifest "$PKG_FILE")
-
-            elif [ -f "$PKG_FILE" ] && \
-                 grep -Eq '<members>[^<]+</members>' "$PKG_FILE"; then
-
-              echo "Using generated delta package.xml."
-
-              DEPLOY_ARGS=(--manifest "$PKG_FILE")
-
-            elif [ -d "delta/force-app/main/default" ] && \
-                 find delta/force-app/main/default -type f -print -quit | grep -q .; then
-
-              echo "Using generated delta source directory."
-
-              DEPLOY_ARGS=(--source-dir delta/force-app/main/default)
-
-            else
-
-              echo "No deployable Salesforce metadata changes found."
-              echo "Skipping actual deployment successfully."
-              exit 0
-
-            fi
-
-            # ---------------------------------------
-            # Add destructive change arguments
-            # ---------------------------------------
-
-            if [ -n "$PRE_XML" ]; then
-              DEPLOY_ARGS+=(--pre-destructive-changes "$PRE_XML")
-              echo "Pre-destructive changes: $PRE_XML"
-            fi
-
-            if [ -n "$POST_XML" ]; then
-              DEPLOY_ARGS+=(--post-destructive-changes "$POST_XML")
-              echo "Post-destructive changes: $POST_XML"
-            fi
-
-            # ---------------------------------------
-            # Execute actual Salesforce deployment
-            # ---------------------------------------
-
-            echo "Starting Salesforce actual deployment..."
-
-            if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
-              IFS=',' read -r -a TEST_CLASSES < <(printf '%s\n' "$TEST_CLASSES_CSV")
-              sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level RunSpecifiedTests --tests "${TEST_CLASSES[@]}" --wait 800 --ignore-warnings --verbose
-            else
-              sf project deploy start "${DEPLOY_ARGS[@]}" --target-org targetorg --test-level "$TEST_LEVEL" --wait 800 --ignore-warnings --verbose
-            fi
-
-            echo "============================================"
-            echo "SUCCESS: Salesforce deployment completed."
-            echo "============================================"
-
-      # -----------------------------------------------
-      # 10. CLEAN UP JWT KEY
-      # -----------------------------------------------
       - run:
-          name: Cleanup JWT Key
-          when: always
+          name: Generate Delta
           command: |
-            rm -f circleci.key
+            mkdir -p delta
 
+            if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+              echo "No previous commit found. Skipping delta."
+              exit 0
+            fi
+
+            BASE_REF="${CIRCLE_BASE_REVISION:-HEAD~1}"
+            echo "Delta range: $BASE_REF..HEAD"
+
+            sf sgd source delta \
+              --from "$BASE_REF" \
+              --to HEAD \
+              --output-dir delta \
+              --generate-delta || true
+
+            echo "===== PACKAGE.XML ====="
+            cat delta/package/package.xml || echo "(no package.xml generated)"
+
+      - run:
+          name: Resolve Apex Tests
+          command: |
+            BASE_REF="${CIRCLE_BASE_REVISION:-HEAD~1}"
+
+            STRICT=false \
+            SOURCE_DIR=force-app \
+            OUTPUT_FILE=apex-tests.txt \
+            bash scripts/resolve-apex-tests.sh "$BASE_REF" HEAD
+
+            echo "===== RESOLVED APEX TESTS ====="
+            if [ -s apex-tests.txt ]; then
+              cat apex-tests.txt
+            else
+              echo "(no tests resolved)"
+            fi
+
+      - run:
+          name: Deploy Changes
+          command: |
+            DEFAULT_TEST="EpicActivityUpdateBatchTest"
+
+            DRY_RUN_FLAG=""
+            if [ "<< parameters.dry_run >>" = "true" ]; then
+              DRY_RUN_FLAG="--dry-run"
+              echo "*** DRY RUN MODE — validate only, nothing saved to org ***"
+            fi
+
+            # --------------------------------------------------------
+            # DELTA DEPLOYMENT
+            # --------------------------------------------------------
+            if [ -f delta/package/package.xml ] && grep -q "<members>" delta/package/package.xml; then
+
+              echo "Delta package found. Determining test level..."
+
+              if [ "$CIRCLE_BRANCH" = "main" ]; then
+                # Prod always requires RunSpecifiedTests (Salesforce platform limitation)
+                # Use resolved tests if available, otherwise fall back to default test
+                if [ ! -s apex-tests.txt ]; then
+                  echo "No Apex changed or no tests resolved. Using default test: $DEFAULT_TEST"
+                  echo "$DEFAULT_TEST" > apex-tests.txt
+                fi
+                CURRENT_TEST_LEVEL="RunSpecifiedTests"
+
+              elif grep -E -q "<name>(ApexClass|ApexTrigger)</name>" delta/package/package.xml; then
+                CURRENT_TEST_LEVEL="RunSpecifiedTests"
+
+              else
+                CURRENT_TEST_LEVEL="NoTestRun"
+              fi
+
+              echo "Test level: $CURRENT_TEST_LEVEL"
+
+              if [ "$CURRENT_TEST_LEVEL" = "RunSpecifiedTests" ]; then
+
+                TEST_ARGS=()
+                while IFS= read -r t; do
+                  [[ -n "$t" ]] && TEST_ARGS+=(--tests "$t")
+                done < <(tr ' ' '\n' < apex-tests.txt | grep -v '^$')
+
+                echo "Tests: ${TEST_ARGS[*]}"
+
+                sf project deploy start \
+                  --target-org targetorg \
+                  --manifest delta/package/package.xml \
+                  --ignore-conflicts \
+                  --test-level RunSpecifiedTests \
+                  "${TEST_ARGS[@]}" \
+                  $DRY_RUN_FLAG \
+                  --verbose
+
+              else
+
+                sf project deploy start \
+                  --target-org targetorg \
+                  --manifest delta/package/package.xml \
+                  --ignore-conflicts \
+                  --test-level "$CURRENT_TEST_LEVEL" \
+                  $DRY_RUN_FLAG \
+                  --verbose
+
+              fi
+
+              exit 0
+
+            fi
+
+            # --------------------------------------------------------
+            # FALLBACK DEPLOYMENT
+            # --------------------------------------------------------
+            echo "No delta package found. Falling back to git diff..."
+
+            CHANGED_FILES=$(git diff HEAD~1 HEAD --name-only | grep '^force-app/' || true)
+
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+
+            if [ -z "$CHANGED_FILES" ]; then
+              echo "No changes detected in force-app. Nothing to deploy."
+              exit 0
+            fi
+
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              # Prod always requires RunSpecifiedTests (Salesforce platform limitation)
+              if [ ! -s apex-tests.txt ]; then
+                echo "No tests resolved. Using default test: $DEFAULT_TEST"
+                echo "$DEFAULT_TEST" > apex-tests.txt
+              fi
+              CURRENT_TEST_LEVEL="RunSpecifiedTests"
+
+            elif echo "$CHANGED_FILES" | grep -E -q "(\.cls|\.cls-meta\.xml|\.trigger|\.trigger-meta\.xml)$"; then
+              CURRENT_TEST_LEVEL="RunSpecifiedTests"
+
+            else
+              CURRENT_TEST_LEVEL="NoTestRun"
+            fi
+
+            echo "Test level: $CURRENT_TEST_LEVEL"
+
+            SF_SOURCE_ARGS=()
+            while IFS= read -r file; do
+              [ -n "$file" ] && SF_SOURCE_ARGS+=(--source-dir "$file")
+            done < <(echo "$CHANGED_FILES")
+
+            if [ "$CURRENT_TEST_LEVEL" = "RunSpecifiedTests" ]; then
+
+              TEST_ARGS=()
+              while IFS= read -r t; do
+                [[ -n "$t" ]] && TEST_ARGS+=(--tests "$t")
+              done < <(tr ' ' '\n' < apex-tests.txt | grep -v '^$')
+
+              echo "Tests: ${TEST_ARGS[*]}"
+
+              sf project deploy start \
+                --target-org targetorg \
+                "${SF_SOURCE_ARGS[@]}" \
+                --ignore-conflicts \
+                --test-level RunSpecifiedTests \
+                "${TEST_ARGS[@]}" \
+                $DRY_RUN_FLAG \
+                --verbose
+
+            else
+
+              sf project deploy start \
+                --target-org targetorg \
+                "${SF_SOURCE_ARGS[@]}" \
+                --ignore-conflicts \
+                --test-level "$CURRENT_TEST_LEVEL" \
+                $DRY_RUN_FLAG \
+                --verbose
+
+            fi
+
+      - store_artifacts:
+          path: apex-tests.txt
+          destination: apex-tests.txt
+
+# ============================================================
+# WORKFLOWS
+# ============================================================
 workflows:
-  # 1. PR validation: run for PR events only, never for the PR-merged (closed) event.
-  pr-validation:
-    when:
-      and:
-        - equal: [pull_request, << pipeline.event.name >>]
-        - not:
-            equal: [closed, << pipeline.event.action >>]
+  version: 2
+
+  deploy_pipeline:
     jobs:
+      # ----------------------------------------------------------
+      # QA — Validate (dry run) → Deploy
+      # ----------------------------------------------------------
+
+      # Step 1: Validate QA deployment
       - deploy:
-          name: validate-pull-request
-          environment: auto
-          mode: validate
-          filters:
-            branches:
-              only:
-                - dev
-                - /feature\/.*/
-                - /release\/.*/
-                - /sprint\/.*/
-                - /HotFix\/.*/
-
-  # 2. Dev: post-merge PR to dev; approval followed by deployment.
-  deploy-dev:
-    when:
-      and:
-        - equal: [pull_request, << pipeline.event.name >>]
-        - equal: [closed, << pipeline.event.action >>]
-        - equal: [true, << pipeline.event.github.pull_request.merged >>]
-        - equal: [dev, << pipeline.git.branch >>]
-    jobs:
-      - approve-dev:
-          type: approval
-          filters:
-            branches:
-              only: dev
-
-      - deploy:
-          name: deploy-dev
-          environment: dev
-          mode: deploy
-          requires:
-            - approve-dev
-          filters:
-            branches:
-              only: dev
-
-  # 3. QA: post-merge PR to qa; approval followed by deployment.
-  deploy-qa:
-    when:
-      and:
-        - equal: [pull_request, << pipeline.event.name >>]
-        - equal: [closed, << pipeline.event.action >>]
-        - equal: [true, << pipeline.event.github.pull_request.merged >>]
-        - equal: [qa, << pipeline.git.branch >>]
-    jobs:
-      - approve-qa:
-          type: approval
+          name: validate-qa
+          username: SF_QA_USERNAME
+          client_id: SF_QA_CLIENT_ID
+          instance_url: SF_QA_INSTANCE_URL
+          jwt_key: JWT_KEY_QA
+          test_level: NoTestRun
+          dry_run: true
           filters:
             branches:
               only: qa
 
+      # Step 2: Actual QA deployment after validation succeeds
       - deploy:
           name: deploy-qa
-          environment: qa
-          mode: deploy
+          username: SF_QA_USERNAME
+          client_id: SF_QA_CLIENT_ID
+          instance_url: SF_QA_INSTANCE_URL
+          jwt_key: JWT_KEY_QA
+          test_level: NoTestRun
+          dry_run: false
           requires:
-            - approve-qa
+            - validate-qa
           filters:
             branches:
               only: qa
 
-  # 4. UAT: post-merge PR to uat; approval followed by deployment only.
-  deploy-uat:
-    when:
-      and:
-        - equal: [pull_request, << pipeline.event.name >>]
-        - equal: [closed, << pipeline.event.action >>]
-        - equal: [true, << pipeline.event.github.pull_request.merged >>]
-        - equal: [uat, << pipeline.git.branch >>]
-    jobs:
-      - approve-uat:
-          type: approval
+      # ----------------------------------------------------------
+      # UAT — Validate (dry run) → Deploy
+      # ----------------------------------------------------------
+
+      # Step 1: Validate UAT deployment
+      - deploy:
+          name: validate-uat
+          username: SF_UAT_USERNAME
+          client_id: SF_UAT_CLIENT_ID
+          instance_url: SF_UAT_INSTANCE_URL
+          jwt_key: JWT_KEY_UAT
+          test_level: NoTestRun
+          dry_run: true
           filters:
             branches:
               only: uat
 
+      # Step 2: Actual UAT deployment after validation succeeds
       - deploy:
           name: deploy-uat
-          environment: uat
-          mode: deploy
+          username: SF_UAT_USERNAME
+          client_id: SF_UAT_CLIENT_ID
+          instance_url: SF_UAT_INSTANCE_URL
+          jwt_key: JWT_KEY_UAT
+          test_level: NoTestRun
+          dry_run: false
           requires:
-            - approve-uat
+            - validate-uat
           filters:
             branches:
               only: uat
 
-  # 5. Production: post-merge PR to main; approval followed by deployment only.
-  deploy-production:
-    when:
-      and:
-        - equal: [pull_request, << pipeline.event.name >>]
-        - equal: [closed, << pipeline.event.action >>]
-        - equal: [true, << pipeline.event.github.pull_request.merged >>]
-        - equal: [main, << pipeline.git.branch >>]
-    jobs:
-      - approve-prod:
-          type: approval
+      # ----------------------------------------------------------
+      # PROD — validate (dry run) → manual approval → deploy
+      # ----------------------------------------------------------
+
+      # Step 1: Dry run against prod — catches failures before approval
+      - deploy:
+          name: validate-prod
+          username: SF_PROD_USERNAME
+          client_id: SF_PROD_CLIENT_ID
+          instance_url: SF_PROD_INSTANCE_URL
+          jwt_key: JWT_KEY_PROD
+          test_level: RunSpecifiedTests
+          dry_run: true
           filters:
             branches:
               only: main
 
+      # Step 2: Manual approval gate — appears after validate-prod passes
+      - approve-prod:
+          type: approval
+          requires:
+            - validate-prod
+          filters:
+            branches:
+              only: main
+
+      # Step 3: Real deploy — runs after approval
       - deploy:
           name: deploy-prod
-          environment: prod
-          mode: deploy
+          username: SF_PROD_USERNAME
+          client_id: SF_PROD_CLIENT_ID
+          instance_url: SF_PROD_INSTANCE_URL
+          jwt_key: JWT_KEY_PROD
+          test_level: RunSpecifiedTests
+          dry_run: false
           requires:
             - approve-prod
           filters:
