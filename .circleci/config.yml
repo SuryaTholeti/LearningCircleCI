@@ -61,8 +61,26 @@ jobs:
           name: Create JWT Key
           command: |
             JWT_VAR="<< parameters.jwt_key >>"
-            printf '%s' "${!JWT_VAR}" | base64 --decode > circlecikey.key
+            JWT_VALUE="${!JWT_VAR:-}"
+
+            if [ -z "$JWT_VALUE" ]; then
+              echo "ERROR: $JWT_VAR environment variable is empty or missing."
+              exit 1
+            fi
+
+            printf '%s' "$JWT_VALUE" | base64 --decode > circlecikey.key
+
+            if [ ! -s circlecikey.key ]; then
+              echo "ERROR: JWT private key decoding failed."
+              exit 1
+            fi
+
             chmod 600 circlecikey.key
+
+            # Validate private key without displaying its contents
+            openssl pkey -in circlecikey.key -noout
+
+            echo "JWT private key decoded and validated successfully."
 
       - run:
           name: Authenticate Salesforce
