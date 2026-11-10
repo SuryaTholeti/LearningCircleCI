@@ -275,13 +275,54 @@ jobs:
 workflows:
   version: 2
 
+  # ----------------------------------------------------------
+  # 1. QA — PR validation (dry run only)
+  # Runs when a PR targets QA and is not closed.
+  # ----------------------------------------------------------
+  validate-qa-pr:
+    when:
+      and:
+        - equal: [pull_request, << pipeline.event.name >>]
+        - not:
+            equal: [closed, << pipeline.event.action >>]
+        - equal: [qa, << pipeline.event.github.pull_request.base.ref >>]
+    jobs:
+      - deploy:
+          name: validate-qa-pr
+          username: SF_QA_USERNAME
+          client_id: SF_QA_CLIENT_ID
+          instance_url: SF_QA_INSTANCE_URL
+          jwt_key: JWT_KEY_QA
+          test_level: NoTestRun
+          dry_run: true
+
+  # ----------------------------------------------------------
+  # 2. UAT — PR validation (dry run only)
+  # Runs when a PR targets UAT and is not closed.
+  # ----------------------------------------------------------
+  validate-uat-pr:
+    when:
+      and:
+        - equal: [pull_request, << pipeline.event.name >>]
+        - not:
+            equal: [closed, << pipeline.event.action >>]
+        - equal: [uat, << pipeline.event.github.pull_request.base.ref >>]
+    jobs:
+      - deploy:
+          name: validate-uat-pr
+          username: SF_UAT_USERNAME
+          client_id: SF_UAT_CLIENT_ID
+          instance_url: SF_UAT_INSTANCE_URL
+          jwt_key: JWT_KEY_UAT
+          test_level: NoTestRun
+          dry_run: true
+
+  # ----------------------------------------------------------
+  # 3. QA — Post-merge deployment
+  # ----------------------------------------------------------
   deploy_pipeline:
     jobs:
-      # ----------------------------------------------------------
       # QA — Validate (dry run) → Deploy
-      # ----------------------------------------------------------
-
-      # Step 1: Validate QA deployment
       - deploy:
           name: validate-qa
           username: SF_QA_USERNAME
@@ -294,7 +335,6 @@ workflows:
             branches:
               only: qa
 
-      # Step 2: Actual QA deployment after validation succeeds
       - deploy:
           name: deploy-qa
           username: SF_QA_USERNAME
@@ -309,11 +349,7 @@ workflows:
             branches:
               only: qa
 
-      # ----------------------------------------------------------
       # UAT — Validate (dry run) → Deploy
-      # ----------------------------------------------------------
-
-      # Step 1: Validate UAT deployment
       - deploy:
           name: validate-uat
           username: SF_UAT_USERNAME
@@ -326,7 +362,6 @@ workflows:
             branches:
               only: uat
 
-      # Step 2: Actual UAT deployment after validation succeeds
       - deploy:
           name: deploy-uat
           username: SF_UAT_USERNAME
@@ -341,11 +376,7 @@ workflows:
             branches:
               only: uat
 
-      # ----------------------------------------------------------
-      # PROD — validate (dry run) → manual approval → deploy
-      # ----------------------------------------------------------
-
-      # Step 1: Dry run against prod — catches failures before approval
+      # PROD — Validate → Manual approval → Deploy
       - deploy:
           name: validate-prod
           username: SF_PROD_USERNAME
@@ -358,7 +389,6 @@ workflows:
             branches:
               only: main
 
-      # Step 2: Manual approval gate — appears after validate-prod passes
       - approve-prod:
           type: approval
           requires:
@@ -367,7 +397,6 @@ workflows:
             branches:
               only: main
 
-      # Step 3: Real deploy — runs after approval
       - deploy:
           name: deploy-prod
           username: SF_PROD_USERNAME
