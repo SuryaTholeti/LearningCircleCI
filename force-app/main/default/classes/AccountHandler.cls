@@ -1,6 +1,7 @@
 public class AccountHandler {
   /**
    * Updates the description of given accounts based on their industry.
+   * checking the industry field and setting the description accordingly.
    * @param accountsList List of Account sObjects to process.
    */
   public static void updateAccountDescriptions(List<Account> accountsList) {
