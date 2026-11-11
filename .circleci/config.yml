@@ -147,7 +147,7 @@ jobs:
             fi
 
       - run:
-          name: Deploy Changes
+          name: Salesforce Deployment Execution
           command: |
             DEFAULT_TEST="EpicActivityUpdateBatchTest"
 
@@ -357,22 +357,11 @@ workflows:
           dry_run: true
 
   # ----------------------------------------------------------
-  # 3. QA — Post-merge deployment
+  # 4. Post-merge deployment
   # ----------------------------------------------------------
   deploy_pipeline:
     jobs:
-      # QA — Validate (dry run) → Deploy
-      - deploy:
-          name: validate-qa
-          username: SF_QA_USERNAME
-          client_id: SF_QA_CLIENT_ID
-          instance_url: SF_QA_INSTANCE_URL
-          jwt_key: JWT_KEY_QA
-          test_level: NoTestRun
-          dry_run: false
-          filters:
-            branches:
-              only: qa
+      # QA —  → Deploy
 
       - deploy:
           name: deploy-qa
@@ -382,25 +371,11 @@ workflows:
           jwt_key: JWT_KEY_QA
           test_level: NoTestRun
           dry_run: false
-          requires:
-            - validate-qa
           filters:
             branches:
               only: qa
 
-      # UAT — Validate (dry run) → Deploy
-      - deploy:
-          name: validate-uat
-          username: SF_UAT_USERNAME
-          client_id: SF_UAT_CLIENT_ID
-          instance_url: SF_UAT_INSTANCE_URL
-          jwt_key: JWT_KEY_UAT
-          test_level: NoTestRun
-          dry_run: false
-          filters:
-            branches:
-              only: uat
-
+      # UAT —  → Deploy
       - deploy:
           name: deploy-uat
           username: SF_UAT_USERNAME
@@ -409,29 +384,13 @@ workflows:
           jwt_key: JWT_KEY_UAT
           test_level: NoTestRun
           dry_run: false
-          requires:
-            - validate-uat
           filters:
             branches:
               only: uat
 
       # PROD — Manual approval → Deploy
-      - deploy:
-          name: validate-prod
-          username: SF_PROD_USERNAME
-          client_id: SF_PROD_CLIENT_ID
-          instance_url: SF_PROD_INSTANCE_URL
-          jwt_key: JWT_KEY_PROD
-          test_level: RunSpecifiedTests
-          dry_run: false
-          filters:
-            branches:
-              only: main
-
       - approve-prod:
           type: approval
-          requires:
-            - validate-prod
           filters:
             branches:
               only: main
