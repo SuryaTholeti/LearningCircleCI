@@ -369,7 +369,7 @@ workflows:
           instance_url: SF_QA_INSTANCE_URL
           jwt_key: JWT_KEY_QA
           test_level: NoTestRun
-          dry_run: true
+          dry_run: false
           filters:
             branches:
               only: qa
@@ -396,7 +396,7 @@ workflows:
           instance_url: SF_UAT_INSTANCE_URL
           jwt_key: JWT_KEY_UAT
           test_level: NoTestRun
-          dry_run: true
+          dry_run: false
           filters:
             branches:
               only: uat
@@ -415,7 +415,7 @@ workflows:
             branches:
               only: uat
 
-      # PROD — Validate → Manual approval → Deploy
+      # PROD — Manual approval → Deploy
       - deploy:
           name: validate-prod
           username: SF_PROD_USERNAME
@@ -423,7 +423,7 @@ workflows:
           instance_url: SF_PROD_INSTANCE_URL
           jwt_key: JWT_KEY_PROD
           test_level: RunSpecifiedTests
-          dry_run: true
+          dry_run: false
           filters:
             branches:
               only: main
