@@ -147,7 +147,7 @@ jobs:
             fi
 
       - run:
-          name: <<# parameters.dry_run >>Salesforce Validate Changes<</ parameters.dry_run >><<# parameters.dry_run >>Salesforce Deploy Changes<</ parameters.dry_run >>
+          name: Salesforce Deployment Execution
           command: |
             DEFAULT_TEST="EpicActivityUpdateBatchTest"
 
