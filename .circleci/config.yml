@@ -357,22 +357,11 @@ workflows:
           dry_run: true
 
   # ----------------------------------------------------------
-  # 3. QA — Post-merge deployment
+  # 3. Post-merge deployment
   # ----------------------------------------------------------
   deploy_pipeline:
     jobs:
       # QA — Validate (dry run) → Deploy
-      - deploy:
-          name: validate-qa
-          username: SF_QA_USERNAME
-          client_id: SF_QA_CLIENT_ID
-          instance_url: SF_QA_INSTANCE_URL
-          jwt_key: JWT_KEY_QA
-          test_level: NoTestRun
-          dry_run: true
-          filters:
-            branches:
-              only: qa
 
       - deploy:
           name: deploy-qa
@@ -389,17 +378,6 @@ workflows:
               only: qa
 
       # UAT — Validate (dry run) → Deploy
-      - deploy:
-          name: validate-uat
-          username: SF_UAT_USERNAME
-          client_id: SF_UAT_CLIENT_ID
-          instance_url: SF_UAT_INSTANCE_URL
-          jwt_key: JWT_KEY_UAT
-          test_level: NoTestRun
-          dry_run: true
-          filters:
-            branches:
-              only: uat
 
       - deploy:
           name: deploy-uat
@@ -415,18 +393,7 @@ workflows:
             branches:
               only: uat
 
-      # PROD — Validate → Manual approval → Deploy
-      - deploy:
-          name: validate-prod
-          username: SF_PROD_USERNAME
-          client_id: SF_PROD_CLIENT_ID
-          instance_url: SF_PROD_INSTANCE_URL
-          jwt_key: JWT_KEY_PROD
-          test_level: RunSpecifiedTests
-          dry_run: true
-          filters:
-            branches:
-              only: main
+      # PROD — Manual approval → Deploy
 
       - approve-prod:
           type: approval
