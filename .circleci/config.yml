@@ -1,3 +1,4 @@
+
 version: 2.1
 
 # ============================================================
@@ -127,9 +128,8 @@ jobs:
             git fetch --unshallow || true
       # --------------------------------------------------------
       # Identify the starting commit for comparison.
-      # For PRs: Compare the target branch with the latest PR commit.
-      # After merging: Use the previous commit as the starting point.
-      # Save the starting commit reference for the next pipeline steps.
+      # For PRs: Consider all changes across multiple commits in the same PR, including dependency-related changes. Compare the target branch with the latest PR commit.
+      # After merging: Use the previous commit as the starting point. Save the same starting commit reference for delta generation, Apex test resolution, and deployment.
       # --------------------------------------------------------
       - run:
           name: Identify PR Base Commit
@@ -415,6 +415,7 @@ workflows:
   # ----------------------------------------------------------
   deploy_pipeline:
     jobs:
+
       # QA — Deploy after merge
       - deploy:
           name: deploy-qa
