@@ -41,10 +41,9 @@ jobs:
         type: string
         default: ""
       test_level:
-        type: string
-        # Used on main branch only.
-        # QA/UAT test level is resolved dynamically.
-
+        type: enum
+        enum: [RunSpecifiedTests, NoTestRun]
+        default: RunSpecifiedTests
       dry_run:
         type: boolean
         default: false
@@ -78,21 +77,16 @@ jobs:
               echo "ERROR: $JWT_VAR environment variable is empty or missing."
               exit 1
             fi
-
             printf '%s' "$JWT_VALUE" | base64 --decode > circlecikey.key
-
             if [ ! -s circlecikey.key ]; then
               echo "ERROR: JWT private key decoding failed."
               exit 1
             fi
-
             chmod 600 circlecikey.key
-
             # Validate private key without displaying its contents
             openssl pkey -in circlecikey.key -noout
 
             echo "JWT private key decoded and validated successfully."
-
       # --------------------------------------------------------
       # Authenticate Salesforce
       # --------------------------------------------------------
@@ -109,14 +103,14 @@ jobs:
               --username "${!USERNAME_VAR}" \
               --instance-url "${!INSTANCE_URL_VAR}" \
               --alias targetorg
-
       # --------------------------------------------------------
       # Install SGD Plugin
       # --------------------------------------------------------
       - run:
           name: Install Delta Plugin
           command: |
-            yes | sf plugins install sfdx-git-delta@latest || true
+            sf plugins install sfdx-git-delta
+            sf plugins | grep -i sfdx-git-delta
       # --------------------------------------------------------
       # Fetch Git History
       # --------------------------------------------------------
@@ -166,7 +160,6 @@ jobs:
             echo "Base commit: $BASE_REF"
             echo "Latest commit: $(git rev-parse HEAD)"
             echo "========================================"
-
       # --------------------------------------------------------
       # Generate Delta
       # --------------------------------------------------------
@@ -185,7 +178,6 @@ jobs:
 
             echo "===== PACKAGE.XML ====="
             cat delta/package/package.xml || echo "(no package.xml generated)"
-
       # --------------------------------------------------------
       # Resolve Apex Tests, Uses exactly the same BASE_REF as SGD.
       # --------------------------------------------------------
@@ -201,90 +193,73 @@ jobs:
             bash scripts/resolve-apex-tests.sh "$BASE_REF" HEAD
 
             echo "===== RESOLVED APEX TESTS ====="
-
             if [ -s apex-tests.txt ]; then
               cat apex-tests.txt
             else
               echo "(no tests resolved)"
             fi
-
       # --------------------------------------------------------
       # Salesforce Validation / Deployment
       # --------------------------------------------------------
       - run:
           name: Salesforce Deployment Execution
           command: |
+            set -euo pipefail
+
             DEFAULT_TEST="EpicActivityUpdateBatchTest"
 
             BASE_REF=$(cat /tmp/deployment-base-ref)
-            DRY_RUN_FLAG=""
-
+            DRY_RUN_ARGS=()
             if [ "<< parameters.dry_run >>" = "true" ]; then
-              DRY_RUN_FLAG="--dry-run"
-              echo "*** DRY RUN MODE — validate only, nothing saved to org ***"
+              DRY_RUN_ARGS+=(--dry-run)
+              echo "*** DRY RUN MODE — validation only ***"
             else
-              echo "*** DEPLOYMENT MODE — changes will be deployed ***"
+              echo "*** DEPLOYMENT MODE — actual deployment ***"
             fi
+            CURRENT_TEST_LEVEL="<< parameters.test_level >>"
+            TEST_ARGS=()
 
-            # ----------------------------------------------------
-            # DELTA DEPLOYMENT
-            # ----------------------------------------------------
-            if [ -f delta/package/package.xml ] && grep -q "<members>" delta/package/package.xml; then
-
-              echo "Delta package found. Determining test level..."
-
-              if [ "$CIRCLE_BRANCH" = "main" ]; then
-
-                # Production requires RunSpecifiedTests
+            case "$CURRENT_TEST_LEVEL" in
+              RunSpecifiedTests)
+                # PR validation and Production deployments run specified Apex tests.
                 if [ ! -s apex-tests.txt ]; then
                   echo "No Apex tests resolved. Using default test: $DEFAULT_TEST"
                   echo "$DEFAULT_TEST" > apex-tests.txt
                 fi
-                CURRENT_TEST_LEVEL="RunSpecifiedTests"
-              elif grep -E -q "<name>(ApexClass|ApexTrigger)</name>" delta/package/package.xml; then
-                CURRENT_TEST_LEVEL="RunSpecifiedTests"
-              else
-                CURRENT_TEST_LEVEL="NoTestRun"
-              fi
-
-              echo "Test level: $CURRENT_TEST_LEVEL"
-
-              if [ "$CURRENT_TEST_LEVEL" = "RunSpecifiedTests" ]; then
-
-                TEST_ARGS=()
-
                 while IFS= read -r t; do
                   [[ -n "$t" ]] && TEST_ARGS+=(--tests "$t")
                 done < <(tr ' ' '\n' < apex-tests.txt | grep -v '^$')
-                echo "Tests: ${TEST_ARGS[*]}"
-                sf project deploy start \
-                  --target-org targetorg \
-                  --manifest delta/package/package.xml \
-                  --ignore-conflicts \
-                  --test-level RunSpecifiedTests \
-                  "${TEST_ARGS[@]}" \
-                  $DRY_RUN_FLAG \
-                  --verbose
-              else
-                sf project deploy start \
-                  --target-org targetorg \
-                  --manifest delta/package/package.xml \
-                  --ignore-conflicts \
-                  --test-level "$CURRENT_TEST_LEVEL" \
-                  $DRY_RUN_FLAG \
-                  --verbose
-              fi
+                if [ ${#TEST_ARGS[@]} -eq 0 ]; then
+                  echo "ERROR: No Apex tests available to execute."
+                  exit 1
+                fi
+                echo "Test level: RunSpecifiedTests"
+                echo "Executing Apex tests: ${TEST_ARGS[*]}"
+                ;;
+              NoTestRun)
+                # QA/UAT post-merge deployments deploy metadata without running tests.
+                echo "Test level: NoTestRun — Apex tests will not be executed."
+                ;;
+              *)
+                echo "ERROR: Unsupported test level: $CURRENT_TEST_LEVEL"
+                exit 1
+                ;;
+            esac
+
+            # ============================================================
+            # DELTA DEPLOYMENT
+            # ============================================================
+            if [ -f delta/package/package.xml ] && grep -q "<members>" delta/package/package.xml; then
+              echo "Delta package found. Deploying with RunSpecifiedTests."
+              sf project deploy start --target-org targetorg --manifest delta/package/package.xml --ignore-conflicts --test-level "$CURRENT_TEST_LEVEL" "${TEST_ARGS[@]}" "${DRY_RUN_ARGS[@]}" --verbose
               exit 0
             fi
 
-            # ----------------------------------------------------
-            # FALLBACK DEPLOYMENT 
-            # Uses the same BASE_REF as SGD and Apex resolver.
-            # ----------------------------------------------------
+            # ============================================================
+            # FALLBACK DEPLOYMENT
+            # ============================================================
             echo "No delta package found. Falling back to git diff..."
-
-            CHANGED_FILES=$(git diff "$BASE_REF" HEAD --name-only | grep '^force-app/' || true)
-
+            CHANGED_FILES=$(git diff "$BASE_REF" HEAD --name-only --diff-filter=AMR | grep '^force-app/' || true)
             echo "Changed files:"
             echo "$CHANGED_FILES"
 
@@ -293,49 +268,13 @@ jobs:
               exit 0
             fi
 
-            if [ "$CIRCLE_BRANCH" = "main" ]; then
-              if [ ! -s apex-tests.txt ]; then
-                echo "No tests resolved. Using default test: $DEFAULT_TEST"
-                echo "$DEFAULT_TEST" > apex-tests.txt
-              fi
-              CURRENT_TEST_LEVEL="RunSpecifiedTests"
-            elif echo "$CHANGED_FILES" | grep -E -q "(\.cls|\.cls-meta\.xml|\.trigger|\.trigger-meta\.xml)$"; then
-              CURRENT_TEST_LEVEL="RunSpecifiedTests"
-            else
-              CURRENT_TEST_LEVEL="NoTestRun"
-            fi
-
-            echo "Test level: $CURRENT_TEST_LEVEL"
-
             SF_SOURCE_ARGS=()
-
             while IFS= read -r file; do
               [ -n "$file" ] && SF_SOURCE_ARGS+=(--source-dir "$file")
-            done < <(echo "$CHANGED_FILES")
+            done <<< "$CHANGED_FILES"
 
-            if [ "$CURRENT_TEST_LEVEL" = "RunSpecifiedTests" ]; then
-              TEST_ARGS=()
-              while IFS= read -r t; do
-                [[ -n "$t" ]] && TEST_ARGS+=(--tests "$t")
-              done < <(tr ' ' '\n' < apex-tests.txt | grep -v '^$')
-              echo "Tests: ${TEST_ARGS[*]}"
-              sf project deploy start \
-                --target-org targetorg \
-                "${SF_SOURCE_ARGS[@]}" \
-                --ignore-conflicts \
-                --test-level RunSpecifiedTests \
-                "${TEST_ARGS[@]}" \
-                $DRY_RUN_FLAG \
-                --verbose
-            else
-              sf project deploy start \
-                --target-org targetorg \
-                "${SF_SOURCE_ARGS[@]}" \
-                --ignore-conflicts \
-                --test-level "$CURRENT_TEST_LEVEL" \
-                $DRY_RUN_FLAG \
-                --verbose
-            fi
+            sf project deploy start --target-org targetorg "${SF_SOURCE_ARGS[@]}" --ignore-conflicts --test-level "$CURRENT_TEST_LEVEL" "${TEST_ARGS[@]}" "${DRY_RUN_ARGS[@]}" --verbose
+
       # --------------------------------------------------------
       # Store Apex Test Resolution Report
       # --------------------------------------------------------
@@ -366,7 +305,7 @@ workflows:
           instance_url: SF_QA_INSTANCE_URL
           jwt_key: JWT_KEY_QA
           target_branch: << pipeline.event.github.pull_request.base.ref >>
-          test_level: NoTestRun
+          test_level: RunSpecifiedTests
           dry_run: true
   # ----------------------------------------------------------
   # 2. UAT — PR validation (dry run only)
@@ -386,7 +325,7 @@ workflows:
           instance_url: SF_UAT_INSTANCE_URL
           jwt_key: JWT_KEY_UAT
           target_branch: << pipeline.event.github.pull_request.base.ref >>
-          test_level: NoTestRun
+          test_level: RunSpecifiedTests
           dry_run: true
   # ----------------------------------------------------------
   # 3. PROD — PR validation (dry run only)
@@ -440,7 +379,7 @@ workflows:
             branches:
               only: uat
 
-      # PROD — Manual approval
+      # PROD — Manual approval after successful validation
       - approve-prod:
           type: approval
           filters:
