@@ -1,4 +1,3 @@
-
 version: 2.1
 
 # ============================================================
@@ -369,53 +368,12 @@ workflows:
           target_branch: << pipeline.event.github.pull_request.base.ref >>
           test_level: NoTestRun
           dry_run: true
-  # ----------------------------------------------------------
-  # 2. UAT — PR validation (dry run only)
-  # ----------------------------------------------------------
-  validate-uat-pr:
-    when:
-      and:
-        - equal: [pull_request, << pipeline.event.name >>]
-        - not:
-            equal: [closed, << pipeline.event.action >>]
-        - equal: [uat, << pipeline.event.github.pull_request.base.ref >>]
-    jobs:
-      - deploy:
-          name: validate-uat-pr
-          username: SF_UAT_USERNAME
-          client_id: SF_UAT_CLIENT_ID
-          instance_url: SF_UAT_INSTANCE_URL
-          jwt_key: JWT_KEY_UAT
-          target_branch: << pipeline.event.github.pull_request.base.ref >>
-          test_level: NoTestRun
-          dry_run: true
-  # ----------------------------------------------------------
-  # 3. PROD — PR validation (dry run only)
-  # ----------------------------------------------------------
-  validate-prod-pr:
-    when:
-      and:
-        - equal: [pull_request, << pipeline.event.name >>]
-        - not:
-            equal: [closed, << pipeline.event.action >>]
-        - equal: [main, << pipeline.event.github.pull_request.base.ref >>]
-    jobs:
-      - deploy:
-          name: validate-prod-pr
-          username: SF_PROD_USERNAME
-          client_id: SF_PROD_CLIENT_ID
-          instance_url: SF_PROD_INSTANCE_URL
-          jwt_key: JWT_KEY_PROD
-          target_branch: << pipeline.event.github.pull_request.base.ref >>
-          test_level: RunSpecifiedTests
-          dry_run: true
 
   # ----------------------------------------------------------
   # 4. Post-merge deployment
   # ----------------------------------------------------------
   deploy_pipeline:
     jobs:
-
       # QA — Deploy after merge
       - deploy:
           name: deploy-qa
@@ -442,14 +400,33 @@ workflows:
             branches:
               only: uat
 
-      # PROD — Manual approval
-      - approve-prod:
-          type: approval
+      # ----------------------------------------------------------
+      # PROD — validate (dry run) → manual approval → deploy
+      # ----------------------------------------------------------
+
+      # Step 1: Dry run against prod — catches failures before approval
+      - deploy:
+          name: validate-prod
+          username: SF_PROD_USERNAME
+          client_id: SF_PROD_CLIENT_ID
+          instance_url: SF_PROD_INSTANCE_URL
+          jwt_key: JWT_KEY_PROD
+          test_level: RunSpecifiedTests
+          dry_run: true
           filters:
             branches:
               only: main
 
-      # PROD — Deploy after approval
+      # Step 2: Manual approval gate — appears after validate-prod passes
+      - approve-prod:
+          type: approval
+          requires:
+            - validate-prod
+          filters:
+            branches:
+              only: main
+
+      # Step 3: Real deploy — runs after approval
       - deploy:
           name: deploy-prod
           username: SF_PROD_USERNAME
